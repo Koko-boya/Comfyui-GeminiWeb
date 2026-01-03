@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-geminiweb"
 description = "ComfyUI node for Gemini Web API - text-to-image, image-to-image, and chat with multi-image input support"
-version = "1.1.0"
+version = "1.0.0"
 license = {text = "MIT"}
 keywords = ["comfyui", "gemini", "image-generation", "ai", "google"]
 readme = "README.md"
