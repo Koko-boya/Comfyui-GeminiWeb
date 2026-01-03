@@ -11,6 +11,6 @@ requires-python = ">=3.8"
 Repository = "https://github.com/Koko-boya/Comfyui-GeminiWeb"
 
 [tool.comfy]
-PublisherId = "kokoboy  "
+PublisherId = "kokoboy"
 DisplayName = " "
 Icon = ""
