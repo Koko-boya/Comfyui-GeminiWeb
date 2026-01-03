@@ -57,12 +57,34 @@ class GeminiWeb:
                 }),
             },
             "optional": {
-                "image": ("IMAGE", {
-                    "tooltip": "Input image (image_to_image/chat)"
+                "image_1": ("IMAGE", {
+                    "tooltip": "Input image 1 (required for image_to_image)"
+                }),
+                "image_2": ("IMAGE", {
+                    "tooltip": "Input image 2 (optional reference)"
+                }),
+                "image_3": ("IMAGE", {
+                    "tooltip": "Input image 3 (optional reference)"
+                }),
+                "image_4": ("IMAGE", {
+                    "tooltip": "Input image 4 (optional reference)"
+                }),
+                "image_5": ("IMAGE", {
+                    "tooltip": "Input image 5 (optional reference)"
                 }),
                 "model": (GEMINI_MODELS, {
                     "default": "gemini-2.5-flash",
                     "tooltip": "Gemini model"
+                }),
+                "timeout": ("INT", {
+                    "default": 120,
+                    "min": 30,
+                    "max": 600,
+                    "tooltip": "API timeout in seconds"
+                }),
+                "image_filter": (["all", "no_watermark", "watermarked"], {
+                    "default": "all",
+                    "tooltip": "Filter: all=both, no_watermark=JPEG only, watermarked=PNG only"
                 }),
                 "cookie_1PSID": ("STRING", {
                     "default": "",
@@ -118,32 +140,60 @@ class GeminiWeb:
         _client_cache[cache_key] = client
         return client
     
-    def execute(self, mode, prompt, auth_method, image=None, model="gemini-2.5-flash", 
+    def execute(self, mode, prompt, auth_method, 
+                image_1=None, image_2=None, image_3=None, image_4=None, image_5=None,
+                model="gemini-2.5-flash", timeout=120, image_filter="all", 
                 cookie_1PSID="", cookie_1PSIDTS=""):
         import torch
+        
+        # Collect all provided images into a list
+        images = [img for img in [image_1, image_2, image_3, image_4, image_5] if img is not None]
         
         # Get or create client
         client = self._get_client(auth_method, cookie_1PSID, cookie_1PSIDTS)
         
         if mode == "text_to_image":
-            return self._text_to_image(client, prompt, model)
+            return self._text_to_image(client, prompt, model, timeout, image_filter)
         elif mode == "image_to_image":
-            if image is None:
-                raise ValueError("image_to_image mode requires an input image")
-            return self._image_to_image(client, image, prompt, model)
+            if not images:
+                raise ValueError("image_to_image mode requires at least one input image")
+            return self._image_to_image(client, images, prompt, model, timeout, image_filter)
         elif mode == "chat":
-            return self._chat(client, prompt, image, model)
+            return self._chat(client, prompt, images, model, timeout)
         else:
             raise ValueError(f"Unknown mode: {mode}")
     
-    def _text_to_image(self, client, prompt, model):
-        """Generate images from text prompts. Returns ALL images as a batch."""
+    def _filter_images(self, images, image_filter):
+        """Filter images based on watermark preference.
+        
+        Images are tagged by client.py based on their position in the response:
+        - Path index 3 = [WATERMARK] (first image)
+        - Path index 6 = [NO_WATERMARK] (second image)
+        """
+        if image_filter == "all":
+            return images
+        
+        filtered = []
+        for img in images:
+            title = img.title.upper()
+            
+            if image_filter == "watermarked" and "[WATERMARK]" in title:
+                filtered.append(img)
+            elif image_filter == "no_watermark" and "[NO_WATERMARK]" in title:
+                filtered.append(img)
+        
+        return filtered if filtered else images  # Fallback to all if filter returns nothing
+    
+    def _text_to_image(self, client, prompt, model, timeout=120, image_filter="all"):
+        """Generate images from text prompts."""
         import torch
         
         async def do_generate():
             response = await client.generate_content(
                 prompt,
-                model=model if model != "unspecified" else None
+                model=model,
+                image_mode=True,
+                timeout=timeout
             )
             return response
         
@@ -156,30 +206,43 @@ class GeminiWeb:
             placeholder = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
             return (placeholder, response_text, thinking)
         
-        print(f"[Gemini] Generated {len(response.images)} image(s)")
-        image_tensors = self._download_all_images(response.images)
+        # Apply image filter (watermark/no_watermark)
+        filtered_images = self._filter_images(response.images, image_filter)
+        print(f"[Gemini] Total: {len(response.images)} images, after filter '{image_filter}': {len(filtered_images)} images")
+        
+        image_tensors = self._download_all_images(filtered_images)
         return (image_tensors, response_text, thinking)
     
-    def _image_to_image(self, client, image, prompt, model):
-        """Edit images using text prompts. Returns ALL images as a batch."""
+    def _image_to_image(self, client, images, prompt, model, timeout=120, image_filter="all"):
+        """Edit images using text prompts. Accepts list of image tensors."""
         import torch
         
-        pil_image = tensor_to_pil(image)
-        temp_path = save_temp_image(pil_image)
+        temp_paths = []
         
         try:
+            # Save all input images to temp files
+            print(f"[Gemini] Processing {len(images)} input image(s)")
+            for img_tensor in images:
+                pil_image = tensor_to_pil(img_tensor)
+                temp_path = save_temp_image(pil_image)
+                temp_paths.append(temp_path)
+            
             async def do_edit():
                 response = await client.generate_content(
                     prompt,
-                    files=[temp_path],
-                    model=model if model != "unspecified" else None
+                    files=temp_paths,
+                    model=model,
+                    image_mode=True,
+                    timeout=timeout
                 )
                 return response
             
             response = run_async(do_edit())
         finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            # Clean up all temp files
+            for temp_path in temp_paths:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
         
         response_text = response.text if response.text else ""
         thinking = self._get_thinking(response)
@@ -188,35 +251,43 @@ class GeminiWeb:
             print("[Gemini] No images in response. Response:", response_text[:200] if response_text else "No text")
             return (image, response_text, thinking)
         
-        print(f"[Gemini] Generated {len(response.images)} image(s)")
-        image_tensors = self._download_all_images(response.images)
+        # Apply image filter (watermark/no_watermark)
+        filtered_images = self._filter_images(response.images, image_filter)
+        print(f"[Gemini] Total: {len(response.images)} images, after filter '{image_filter}': {len(filtered_images)} images")
+        
+        image_tensors = self._download_all_images(filtered_images)
         return (image_tensors, response_text, thinking)
     
-    def _chat(self, client, prompt, image, model):
-        """Chat with Gemini, optionally with image input."""
+    def _chat(self, client, prompt, images, model, timeout=120):
+        """Chat with Gemini, optionally with multiple image inputs."""
         import torch
         
-        temp_path = None
-        files = None
+        temp_paths = []
         
         try:
-            if image is not None:
-                pil_image = tensor_to_pil(image)
-                temp_path = save_temp_image(pil_image)
-                files = [temp_path]
+            # Save all input images to temp files
+            if images:
+                print(f"[Gemini] Chat with {len(images)} image(s)")
+                for img_tensor in images:
+                    pil_image = tensor_to_pil(img_tensor)
+                    temp_path = save_temp_image(pil_image)
+                    temp_paths.append(temp_path)
             
             async def do_chat():
                 response = await client.generate_content(
                     prompt,
-                    files=files,
-                    model=model if model != "unspecified" else None
+                    files=temp_paths if temp_paths else None,
+                    model=model,
+                    timeout=timeout
                 )
                 return response
             
             response = run_async(do_chat())
         finally:
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
+            # Clean up all temp files
+            for temp_path in temp_paths:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
         
         response_text = response.text if response.text else ""
         thinking = self._get_thinking(response)

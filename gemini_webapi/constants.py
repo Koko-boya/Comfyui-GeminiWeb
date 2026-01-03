@@ -25,6 +25,11 @@ class GRPC(StrEnum):
     UPDATE_GEM = "kHv0Vd"
     DELETE_GEM = "UXcSJb"
 
+    # Content generation (batchexecute)
+    TEXT_GENERATE = "qpEbW"      # Text/Chat generation
+    IMAGE_GENERATE = "aPya6c"    # Image generation  
+    HEARTBEAT = "ESY5D"          # Session heartbeat
+
 
 class Headers(Enum):
     GEMINI = {
@@ -34,11 +39,21 @@ class Headers(Enum):
         "Referer": "https://gemini.google.com/",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "X-Same-Domain": "1",
+        "x-goog-ext-73010989-jspb": "[0]",
     }
     ROTATE_COOKIES = {
         "Content-Type": "application/json",
     }
     UPLOAD = {"Push-ID": "feeds/mcudyrk2a4khkz"}
+    IMAGE_MODE = {
+        "x-goog-ext-525001261-jspb": "[1,null,null,null,null,null,null,0,[4],null,null,2]",
+        "x-goog-ext-73010989-jspb": "[0]",
+    }
+    BROWSER = {
+        "x-browser-channel": "stable",
+        "x-browser-copyright": "Copyright 2025 Google LLC. All rights reserved.",
+        "x-browser-year": "1969",
+    }
 
 
 class Model(Enum):
@@ -46,21 +61,24 @@ class Model(Enum):
     G_3_0_PRO = (
         "gemini-3.0-pro",
         {
-            "x-goog-ext-525001261-jspb": '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4]]'
+            "x-goog-ext-525001261-jspb": '[1,null,null,null,"e6fa609c3fa255c0",null,null,0,[4],null,null,2]',
+            "x-goog-ext-73010989-jspb": "[0]",
         },
         False,
     )
     G_2_5_PRO = (
         "gemini-2.5-pro",
         {
-            "x-goog-ext-525001261-jspb": '[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4]]'
+            "x-goog-ext-525001261-jspb": '[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4],null,null,2]',
+            "x-goog-ext-73010989-jspb": "[0]",
         },
         False,
     )
     G_2_5_FLASH = (
         "gemini-2.5-flash",
         {
-            "x-goog-ext-525001261-jspb": '[1,null,null,null,"9ec249fc9ad08861",null,null,0,[4]]'
+            "x-goog-ext-525001261-jspb": '[1,null,null,null,"9ec249fc9ad08861",null,null,0,[4],null,null,2]',
+            "x-goog-ext-73010989-jspb": "[0]",
         },
         False,
     )
@@ -103,8 +121,11 @@ class ErrorCode(IntEnum):
     Known error codes returned from server.
     """
 
+    CONTENT_SAFETY_3 = 3  # Safety filter rejection
+    CONTENT_SAFETY_4 = 4  # Safety filter rejection (alternate)
     TEMPORARY_ERROR_1013 = 1013  # Randomly raised when generating with certain models, but disappears soon after
     USAGE_LIMIT_EXCEEDED = 1037
     MODEL_INCONSISTENT = 1050
     MODEL_HEADER_INVALID = 1052
     IP_TEMPORARILY_BLOCKED = 1060
+

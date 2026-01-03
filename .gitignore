@@ -22,3 +22,6 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# HTTP Archive files (debugging)
+*.har

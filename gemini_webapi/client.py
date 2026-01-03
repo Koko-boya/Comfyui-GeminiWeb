@@ -8,7 +8,7 @@ import orjson as json
 from httpx import AsyncClient, ReadTimeout, Response
 
 from .components import GemMixin
-from .constants import Endpoint, ErrorCode, Headers, Model
+from .constants import Endpoint, ErrorCode, GRPC, Headers, Model
 from .exceptions import (
     APIError,
     AuthError,
@@ -145,7 +145,7 @@ class GeminiClient(GemMixin):
                 timeout=timeout,
                 proxy=self.proxy,
                 follow_redirects=True,
-                headers=Headers.GEMINI.value,
+                headers={**Headers.GEMINI.value, **Headers.BROWSER.value},
                 cookies=valid_cookies,
                 **self.kwargs,
             )
@@ -242,6 +242,7 @@ class GeminiClient(GemMixin):
         model: Model | str | dict = Model.UNSPECIFIED,
         gem: Gem | str | None = None,
         chat: Optional["ChatSession"] = None,
+        image_mode: bool = False,
         **kwargs,
     ) -> ModelOutput:
         """
@@ -305,36 +306,110 @@ class GeminiClient(GemMixin):
         if self.auto_close:
             await self.reset_close_task()
 
+        # Build final headers
+        final_headers = {}
+        
+        # Setup image mode if requested
+        if image_mode:
+            import uuid
+            session_uuid = str(uuid.uuid4()).upper()
+            
+            # For image mode, build header with correct extended format
+            # Image mode REQUIRES a valid model ID - default to gemini-2.5-flash if unspecified
+            model_header_str = model.model_header.get("x-goog-ext-525001261-jspb", "")
+            if '"' in model_header_str:
+                # Extract model ID from existing header
+                model_id = model_header_str.split('"')[1]
+            else:
+                # Default to gemini-2.5-flash model ID for image mode
+                model_id = "9ec249fc9ad08861"  # G_2_5_FLASH model ID
+            
+            final_headers["x-goog-ext-525001261-jspb"] = f'[1,null,null,null,"{model_id}",null,null,0,[4],null,null,2]'
+            final_headers["x-goog-ext-525005358-jspb"] = f'["{session_uuid}",1]'
+            # Note: x-goog-ext-73010989-jspb is now included in base GEMINI headers
+        else:
+            # Non-image mode: use model headers if specified
+            session_uuid = None  # No session UUID needed for text mode
+            if model.model_header:
+                final_headers = {**model.model_header}
+
+
         try:
+            # Helper function to build payload array with specific values at specific positions
+            def build_payload(size: int, values: dict) -> list:
+                """Build an array of given size with values at specific positions."""
+                payload = [None] * size
+                for pos, val in values.items():
+                    payload[pos] = val
+                return payload
+            
+            # Build prompt data for position 0
+            if files:
+                prompt_data = [
+                    prompt,
+                    0,
+                    None,
+                    [
+                        [
+                            [await upload_file(file, self.proxy)],
+                            parse_file_name(file),
+                        ]
+                        for file in files
+                    ],
+                    None,
+                    None,
+                    0,
+                ]
+            else:
+                prompt_data = [prompt, 0, None, None, None, None, 0]
+            
+            # Chat metadata for position 2
+            chat_metadata = chat.metadata if chat else ["", "", "", None, None, None, None, None, None, ""]
+            
+            if image_mode:
+                # Image mode: Build a 67-element array matching HAR structure
+                import time
+                current_time = int(time.time())
+                timestamp_ns = int((time.time() % 1) * 1000000000)
+                
+                # Define required values at specific positions for image generation
+                image_mode_values = {
+                    0: prompt_data,
+                    1: ["en"],
+                    2: chat_metadata,
+                    7: 1,               # Enable image mode
+                    10: 1,              # Image mode flag
+                    17: [[0]],          # Image mode indicator
+                    27: 1,              # Required flag
+                    30: [4],            # Image format indicator
+                    41: [1],            # Required flag
+                    49: 14,             # Image generation type
+                    59: session_uuid,   # Session UUID
+                    66: [current_time, timestamp_ns],  # Timestamp
+                }
+                inner_payload = build_payload(67, image_mode_values)
+            else:
+                # Text mode: Simpler payload structure
+                text_mode_values = {
+                    0: prompt_data,
+                    1: ["en"],
+                    2: chat_metadata,
+                }
+                inner_payload = build_payload(20, text_mode_values)
+                
+                # Append gem_id if provided
+                if gem_id:
+                    inner_payload.extend([None] * 16 + [gem_id])
+            
             response = await self.client.post(
                 Endpoint.GENERATE.value,
-                headers=model.model_header,
+                headers=final_headers,
                 data={
                     "at": self.access_token,
                     "f.req": json.dumps(
                         [
                             None,
-                            json.dumps(
-                                [
-                                    files
-                                    and [
-                                        prompt,
-                                        0,
-                                        None,
-                                        [
-                                            [
-                                                [await upload_file(file, self.proxy)],
-                                                parse_file_name(file),
-                                            ]
-                                            for file in files
-                                        ],
-                                    ]
-                                    or [prompt],
-                                    None,
-                                    chat and chat.metadata,
-                                ]
-                                + (gem_id and [None] * 16 + [gem_id] or [])
-                            ).decode(),
+                            json.dumps(inner_payload).decode(),
                         ]
                     ).decode(),
                 },
@@ -352,7 +427,34 @@ class GeminiClient(GemMixin):
                 f"Failed to generate contents. Request failed with status code {response.status_code}"
             )
         else:
+            # Debug: Save request and response to files for analysis
+            import os
+            debug_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            
+            # Save request payload
+            try:
+                request_data = {
+                    "headers": dict(final_headers),
+                    "inner_payload": inner_payload,
+                    "image_mode": image_mode,
+                    "session_uuid": session_uuid if image_mode else None,
+                }
+                with open(os.path.join(debug_dir, "debug_request.txt"), "w", encoding="utf-8") as f:
+                    f.write(json.dumps(request_data, option=json.OPT_INDENT_2).decode())
+                logger.debug(f"Saved request to {debug_dir}/debug_request.txt")
+            except Exception as e:
+                logger.debug(f"Failed to save request: {e}")
+            
+            # Save response
+            try:
+                with open(os.path.join(debug_dir, "debug_response.txt"), "w", encoding="utf-8") as f:
+                    f.write(response.text)
+                logger.debug(f"Saved response to {debug_dir}/debug_response.txt")
+            except Exception as e:
+                logger.debug(f"Failed to save response: {e}")
+            
             response_json: list[Any] = []
+
             body: list[Any] = []
             body_index = 0
 
@@ -378,8 +480,40 @@ class GeminiClient(GemMixin):
                 await self.close()
 
                 try:
+                    # First check for batchexecute safety filter responses
+                    # Safety filter returns [3] or [4] at index [0][5]
+                    safety_code = get_nested_value(response_json, [0, 5], None)
+                    if safety_code == [3] or safety_code == [4] or safety_code == 3 or safety_code == 4:
+                        raise GeminiError(
+                            "Failed to generate contents. Your prompt was rejected by Gemini's content safety filters. "
+                            "Please try a different prompt that doesn't trigger content moderation."
+                        )
+                    
+                    # Check for BardErrorInfo response (code [5,...] at index [0][5])
+                    # This indicates various API errors including image session issues (1115)
+                    if isinstance(safety_code, list) and len(safety_code) >= 1 and safety_code[0] == 5:
+                        # Extract error code from BardErrorInfo if present
+                        bard_error_code = get_nested_value(response_json, [0, 5, 2, 0, 1, 0], -1)
+                        if bard_error_code == 1115:
+                            raise APIError(
+                                "Failed to generate image. Image generation session initialization failed (Error 1115). "
+                                "This may be a temporary issue - please try again or check your cookies."
+                            )
+                        else:
+                            logger.debug(f"BardErrorInfo with code: {bard_error_code}")
+                            raise APIError(
+                                f"Failed to generate contents. Gemini returned error code {bard_error_code}. "
+                                "Please try again or check your authentication."
+                            )
+                    
+                    # Then check for standard error codes
                     error_code = get_nested_value(response_json, [0, 5, 2, 0, 1, 0], -1)
                     match error_code:
+                        case ErrorCode.CONTENT_SAFETY_3 | ErrorCode.CONTENT_SAFETY_4:
+                            raise GeminiError(
+                                "Failed to generate contents. Your prompt was rejected by Gemini's content safety filters. "
+                                "Please try a different prompt that doesn't trigger content moderation."
+                            )
                         case ErrorCode.USAGE_LIMIT_EXCEEDED:
                             raise UsageLimitExceeded(
                                 f"Failed to generate contents. Usage limit of {model.model_name} model has exceeded. Please try switching to another model."
@@ -444,74 +578,128 @@ class GeminiClient(GemMixin):
 
                     # Generated images
                     generated_images = []
-                    if get_nested_value(candidate, [12, 7, 0]):
+                    
+                    # Check if this is an image generation response
+                    # candidate[12][6] == [0] indicates image mode was used
+                    # candidate[12][7] contains the generated images (may be empty in initial chunks)
+                    candidate_12 = get_nested_value(candidate, [12])
+                    is_image_mode = (
+                        isinstance(candidate_12, list) and 
+                        len(candidate_12) > 6 and 
+                        candidate_12[6] == [0]
+                    )
+                    
+                    if is_image_mode:
+                        logger.debug(f"Image mode detected (candidate[12][6] == [0]), searching for generated images...")
+                        
+                        # Search through all response parts for the one containing images
                         img_body = None
                         for img_part_index, part in enumerate(response_json):
-                            if img_part_index < body_index:
-                                continue
                             try:
                                 img_part_body = get_nested_value(part, [2])
                                 if not img_part_body:
                                     continue
 
                                 img_part_json = json.loads(img_part_body)
-                                if get_nested_value(
+                                # Check if this part has images at [4][candidate_index][12][7][0]
+                                img_data = get_nested_value(
                                     img_part_json, [4, candidate_index, 12, 7, 0]
-                                ):
+                                )
+                                if img_data:
+                                    logger.debug(f"Found image data in response part {img_part_index}")
                                     img_body = img_part_json
                                     break
                             except json.JSONDecodeError:
                                 continue
 
-                        if not img_body:
-                            raise ImageGenerationError(
-                                "Failed to parse generated images. Please update gemini_webapi to the latest version. "
-                                "If the error persists and is caused by the package, please report it on GitHub."
+                        if img_body:
+                            img_candidate = get_nested_value(
+                                img_body, [4, candidate_index], []
                             )
 
-                        img_candidate = get_nested_value(
-                            img_body, [4, candidate_index], []
-                        )
+                            if finished_text := get_nested_value(
+                                img_candidate, [1, 0]
+                            ):  # Only overwrite if new text is returned after image generation
+                                text = re.sub(
+                                    r"http://googleusercontent\.com/image_generation_content/\d+",
+                                    "",
+                                    finished_text,
+                                ).rstrip()
 
-                        if finished_text := get_nested_value(
-                            img_candidate, [1, 0]
-                        ):  # Only overwrite if new text is returned after image generation
-                            text = re.sub(
-                                r"http://googleusercontent\.com/image_generation_content/\d+",
-                                "",
-                                finished_text,
-                            ).rstrip()
+                            for img_index, gen_img_data in enumerate(
+                                get_nested_value(img_candidate, [12, 7, 0], [])
+                            ):
+                                # Debug: Log the structure of gen_img_data to understand image locations
+                                logger.debug(f"gen_img_data[{img_index}] type: {type(gen_img_data)}, len: {len(gen_img_data) if isinstance(gen_img_data, list) else 'N/A'}")
+                                if isinstance(gen_img_data, list):
+                                    for i, item in enumerate(gen_img_data[:5]):  # Log first 5 elements
+                                        if item is not None:
+                                            logger.debug(f"  gen_img_data[{img_index}][{i}] = {str(item)[:150]}")
+                                
+                                # Images can be at multiple paths within each gen_img_data:
+                                # - First image: [0][3][3] → gen_img_data[0][3] is first image data
+                                # - Second image: [0][6][3] → gen_img_data[0][6] is second image data (at index 6!)
+                                # The structure is: [[null,null,null,[img1],null,null,[img2],...],...]
+                                
+                                image_paths = [
+                                    [0, 3, 3],    # First image: gen_img_data[0][3][3]
+                                    [0, 6, 3],    # Second image: gen_img_data[0][6][3] (index 6!)
+                                    [0, 0, 3, 3], # Alternative nested path
+                                    [0, 0, 6, 3], # Alternative for second image
+                                ]
+                                
 
-                        for img_index, gen_img_data in enumerate(
-                            get_nested_value(img_candidate, [12, 7, 0], [])
-                        ):
-                            url = get_nested_value(gen_img_data, [0, 3, 3])
-                            if not url:
-                                continue
+                                for path in image_paths:
+                                    url = get_nested_value(gen_img_data, path)
+                                    logger.debug(f"  Path {path} -> {str(url)[:100] if url else 'None'}")
+                                    if url and isinstance(url, str) and url.startswith("http"):
+                                        # Check if we already added this URL (avoid duplicates)
+                                        if any(img.url == url for img in generated_images):
+                                            logger.debug(f"    Skipping duplicate URL")
+                                            continue
+                                        
+                                        # Get filename from the same path but at index 2 instead of 3
+                                        # Structure: [None, 1, 'filename.png', 'url', ...]
+                                        filename_path = path[:-1] + [2]  # Replace last index (3) with 2
+                                        filename = get_nested_value(gen_img_data, filename_path, "")
+                                        
+                                        # Determine watermark status by path index:
+                                        # - Index 3 paths = watermarked (first image)
+                                        # - Index 6 paths = no watermark (second image)
+                                        path_index = path[1] if len(path) > 1 else path[-2] if len(path) > 2 else 3
+                                        is_watermarked = path_index == 3 or path_index == 0  # 0, 3 = watermark; 6 = no watermark
+                                        watermark_tag = "[WATERMARK]" if is_watermarked else "[NO_WATERMARK]"
+                                        
+                                        logger.debug(f"    Filename: {filename}, Path index: {path_index}, Watermark: {is_watermarked}")
+                                        
+                                        # Title includes watermark tag for filtering
+                                        img_num = len(generated_images) + 1
+                                        title = f"{watermark_tag} {filename}" if filename else f"{watermark_tag} Image {img_num}"
 
-                            img_num = get_nested_value(gen_img_data, [3, 6])
-                            title = (
-                                f"[Generated Image {img_num}]"
-                                if img_num
-                                else "[Generated Image]"
-                            )
+                                        alt_list = (
+                                            get_nested_value(gen_img_data, [3, 5], []) or
+                                            get_nested_value(gen_img_data, [0, 3, 5], [])
+                                        )
+                                        alt = (
+                                            get_nested_value(alt_list, [img_index])
+                                            or get_nested_value(alt_list, [0])
+                                            or ""
+                                        )
 
-                            alt_list = get_nested_value(gen_img_data, [3, 5], [])
-                            alt = (
-                                get_nested_value(alt_list, [img_index])
-                                or get_nested_value(alt_list, [0])
-                                or ""
-                            )
+                                        generated_images.append(
+                                            GeneratedImage(
+                                                url=url,
+                                                title=title,
+                                                alt=alt,
+                                                proxy=self.proxy,
+                                                cookies=self.cookies,
+                                            )
+                                        )
 
-                            generated_images.append(
-                                GeneratedImage(
-                                    url=url,
-                                    title=title,
-                                    alt=alt,
-                                    proxy=self.proxy,
-                                    cookies=self.cookies,
-                                )
-                            )
+                                
+                            logger.debug(f"Extracted {len(generated_images)} generated images")
+                        else:
+                            logger.debug("Image mode detected but no image data found in any response part")
 
                     output_candidates.append(
                         Candidate(
