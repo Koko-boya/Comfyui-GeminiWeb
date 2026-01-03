@@ -243,6 +243,7 @@ class GeminiClient(GemMixin):
         gem: Gem | str | None = None,
         chat: Optional["ChatSession"] = None,
         image_mode: bool = False,
+        debug_mode: bool = False,
         **kwargs,
     ) -> ModelOutput:
         """
@@ -427,31 +428,30 @@ class GeminiClient(GemMixin):
                 f"Failed to generate contents. Request failed with status code {response.status_code}"
             )
         else:
-            # Debug: Save request and response to files for analysis
-            import os
-            debug_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            
-            # Save request payload
-            try:
-                request_data = {
-                    "headers": dict(final_headers),
-                    "inner_payload": inner_payload,
-                    "image_mode": image_mode,
-                    "session_uuid": session_uuid if image_mode else None,
-                }
-                with open(os.path.join(debug_dir, "debug_request.txt"), "w", encoding="utf-8") as f:
-                    f.write(json.dumps(request_data, option=json.OPT_INDENT_2).decode())
-                logger.debug(f"Saved request to {debug_dir}/debug_request.txt")
-            except Exception as e:
-                logger.debug(f"Failed to save request: {e}")
-            
-            # Save response
-            try:
-                with open(os.path.join(debug_dir, "debug_response.txt"), "w", encoding="utf-8") as f:
-                    f.write(response.text)
-                logger.debug(f"Saved response to {debug_dir}/debug_response.txt")
-            except Exception as e:
-                logger.debug(f"Failed to save response: {e}")
+            # Debug: Save request and response to files if debug_mode is enabled
+            if debug_mode:
+                import os
+                debug_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                
+                try:
+                    request_data = {
+                        "prompt": prompt,
+                        "files": [str(f) for f in files] if files else None,
+                        "image_mode": image_mode,
+                        "model": model.model_name if hasattr(model, 'model_name') else str(model),
+                    }
+                    with open(os.path.join(debug_dir, "debug_request.txt"), "w", encoding="utf-8") as f:
+                        f.write(json.dumps(request_data, option=json.OPT_INDENT_2).decode())
+                    print(f"[Gemini Debug] Saved request to {debug_dir}/debug_request.txt")
+                except Exception as e:
+                    logger.debug(f"Failed to save request: {e}")
+                
+                try:
+                    with open(os.path.join(debug_dir, "debug_response.txt"), "w", encoding="utf-8") as f:
+                        f.write(response.text)
+                    print(f"[Gemini Debug] Saved response to {debug_dir}/debug_response.txt")
+                except Exception as e:
+                    logger.debug(f"Failed to save response: {e}")
             
             response_json: list[Any] = []
 
@@ -580,20 +580,27 @@ class GeminiClient(GemMixin):
                     generated_images = []
                     
                     # Check if this is an image generation response
-                    # candidate[12][6] == [0] indicates image mode was used
-                    # candidate[12][7] contains the generated images (may be empty in initial chunks)
+                    # candidate[12][6] indicates image mode status:
+                    #   [0] = still generating, [2] or [3] = complete with images
+                    # We need to find the LAST chunk with complete images, not the first
                     candidate_12 = get_nested_value(candidate, [12])
                     is_image_mode = (
                         isinstance(candidate_12, list) and 
                         len(candidate_12) > 6 and 
-                        candidate_12[6] == [0]
+                        isinstance(candidate_12[6], list) and
+                        len(candidate_12[6]) > 0
                     )
                     
                     if is_image_mode:
-                        logger.debug(f"Image mode detected (candidate[12][6] == [0]), searching for generated images...")
+                        img_mode_status = candidate_12[6][0] if candidate_12[6] else None
+                        if debug_mode:
+                            logger.debug(f"Image mode detected (candidate[12][6] = {candidate_12[6]}), status={img_mode_status}")
                         
-                        # Search through all response parts for the one containing images
+                        # Search through ALL response parts and keep the LAST one with complete images
+                        # Complete = [12][6][0] >= 2 (not 0 which means still generating)
                         img_body = None
+                        best_status = -1
+                        
                         for img_part_index, part in enumerate(response_json):
                             try:
                                 img_part_body = get_nested_value(part, [2])
@@ -601,16 +608,30 @@ class GeminiClient(GemMixin):
                                     continue
 
                                 img_part_json = json.loads(img_part_body)
-                                # Check if this part has images at [4][candidate_index][12][7][0]
-                                img_data = get_nested_value(
-                                    img_part_json, [4, candidate_index, 12, 7, 0]
-                                )
-                                if img_data:
-                                    logger.debug(f"Found image data in response part {img_part_index}")
-                                    img_body = img_part_json
-                                    break
+                                
+                                # Check the status of this part's [12][6] 
+                                part_candidate = get_nested_value(img_part_json, [4, candidate_index])
+                                part_status_arr = get_nested_value(part_candidate, [12, 6])
+                                part_status = part_status_arr[0] if isinstance(part_status_arr, list) and part_status_arr else -1
+                                
+                                # We want the part with highest status (2 or 3 = complete)
+                                # Also check if it has actual image data
+                                if isinstance(part_status, int) and part_status >= best_status:
+                                    # Check for image data at [12][6][1] (image-to-image) or [12][7][0] (text-to-image)
+                                    has_img_data = (
+                                        get_nested_value(part_candidate, [12, 6, 1]) or
+                                        get_nested_value(part_candidate, [12, 7, 0])
+                                    )
+                                    if has_img_data or part_status > best_status:
+                                        best_status = part_status
+                                        img_body = img_part_json
+                                        if debug_mode:
+                                            logger.debug(f"Found better response part {img_part_index} with status={part_status}")
                             except json.JSONDecodeError:
                                 continue
+                        
+                        if debug_mode:
+                            logger.debug(f"Selected response part with status={best_status}")
 
                         if img_body:
                             img_candidate = get_nested_value(
@@ -630,11 +651,12 @@ class GeminiClient(GemMixin):
                                 get_nested_value(img_candidate, [12, 7, 0], [])
                             ):
                                 # Debug: Log the structure of gen_img_data to understand image locations
-                                logger.debug(f"gen_img_data[{img_index}] type: {type(gen_img_data)}, len: {len(gen_img_data) if isinstance(gen_img_data, list) else 'N/A'}")
-                                if isinstance(gen_img_data, list):
-                                    for i, item in enumerate(gen_img_data[:5]):  # Log first 5 elements
-                                        if item is not None:
-                                            logger.debug(f"  gen_img_data[{img_index}][{i}] = {str(item)[:150]}")
+                                if debug_mode:
+                                    logger.debug(f"gen_img_data[{img_index}] type: {type(gen_img_data)}, len: {len(gen_img_data) if isinstance(gen_img_data, list) else 'N/A'}")
+                                    if isinstance(gen_img_data, list):
+                                        for i, item in enumerate(gen_img_data[:5]):  # Log first 5 elements
+                                            if item is not None:
+                                                logger.debug(f"  gen_img_data[{img_index}][{i}] = {str(item)[:150]}")
                                 
                                 # Images can be at multiple paths within each gen_img_data:
                                 # - First image: [0][3][3] → gen_img_data[0][3] is first image data
@@ -651,11 +673,13 @@ class GeminiClient(GemMixin):
 
                                 for path in image_paths:
                                     url = get_nested_value(gen_img_data, path)
-                                    logger.debug(f"  Path {path} -> {str(url)[:100] if url else 'None'}")
+                                    if debug_mode:
+                                        logger.debug(f"  Path {path} -> {str(url)[:100] if url else 'None'}")
                                     if url and isinstance(url, str) and url.startswith("http"):
                                         # Check if we already added this URL (avoid duplicates)
                                         if any(img.url == url for img in generated_images):
-                                            logger.debug(f"    Skipping duplicate URL")
+                                            if debug_mode:
+                                                logger.debug(f"    Skipping duplicate URL")
                                             continue
                                         
                                         # Get filename from the same path but at index 2 instead of 3
@@ -670,7 +694,8 @@ class GeminiClient(GemMixin):
                                         is_watermarked = path_index == 3 or path_index == 0  # 0, 3 = watermark; 6 = no watermark
                                         watermark_tag = "[WATERMARK]" if is_watermarked else "[NO_WATERMARK]"
                                         
-                                        logger.debug(f"    Filename: {filename}, Path index: {path_index}, Watermark: {is_watermarked}")
+                                        if debug_mode:
+                                            logger.debug(f"    Filename: {filename}, Path index: {path_index}, Watermark: {is_watermarked}")
                                         
                                         # Title includes watermark tag for filtering
                                         img_num = len(generated_images) + 1
@@ -697,9 +722,66 @@ class GeminiClient(GemMixin):
                                         )
 
                                 
-                            logger.debug(f"Extracted {len(generated_images)} generated images")
+                            if debug_mode:
+                                logger.debug(f"Extracted {len(generated_images)} generated images from standard path")
+                            
+                            # Fallback: If no images found via standard paths, search in candidate[12][6]
+                            # Image-to-image responses have images at [12][6][1][0][0][0][3] (PNG) and [12][6][1][0][0][3] (JPEG)
+                            if not generated_images and img_candidate:
+                                if debug_mode:
+                                    logger.debug("No images from standard path, searching image-to-image path in candidate[12][6]...")
+                                
+                                # Image-to-image structure: candidate[12][6] = [2, [[[[null,null,null,PNG],null,null,JPEG]...]]]
+                                img_edit_data = get_nested_value(img_candidate, [12, 6], None)
+                                if img_edit_data and isinstance(img_edit_data, list) and len(img_edit_data) > 1:
+                                    # Path to images: [12][6][1][0][0][0] contains the image array
+                                    img_array = get_nested_value(img_edit_data, [1, 0, 0, 0], None)
+                                    
+                                    if img_array and isinstance(img_array, list):
+                                        if debug_mode:
+                                            logger.debug(f"Found image array at [12][6][1][0][0][0], len: {len(img_array)}")
+                                        
+                                        # PNG is at position 3: [null, null, null, [null,1,"file.png","url",...]]
+                                        png_data = get_nested_value(img_array, [3], None)
+                                        if png_data and isinstance(png_data, list) and len(png_data) > 3:
+                                            url = png_data[3] if len(png_data) > 3 else None
+                                            filename = png_data[2] if len(png_data) > 2 else ""
+                                            if url and isinstance(url, str) and url.startswith("http") and "gg-dl" in url:
+                                                if debug_mode:
+                                                    logger.debug(f"Found PNG at [12][6][1][0][0][0][3]: {url[:80]}...")
+                                                generated_images.append(
+                                                    GeneratedImage(
+                                                        url=url,
+                                                        title=f"[WATERMARK] {filename}" if filename else "[WATERMARK] Image",
+                                                        alt="",
+                                                        proxy=self.proxy,
+                                                        cookies=self.cookies,
+                                                    )
+                                                )
+                                        
+                                        # JPEG is at parent level position 3: get_nested_value([12][6][1][0][0], [3])
+                                        jpeg_container = get_nested_value(img_edit_data, [1, 0, 0, 3], None)
+                                        if jpeg_container and isinstance(jpeg_container, list) and len(jpeg_container) > 3:
+                                            url = jpeg_container[3] if len(jpeg_container) > 3 else None
+                                            filename = jpeg_container[2] if len(jpeg_container) > 2 else ""
+                                            if url and isinstance(url, str) and url.startswith("http") and "gg-dl" in url:
+                                                if debug_mode:
+                                                    logger.debug(f"Found JPEG at [12][6][1][0][0][3]: {url[:80]}...")
+                                                generated_images.append(
+                                                    GeneratedImage(
+                                                        url=url,
+                                                        title=f"[NO_WATERMARK] {filename}" if filename else "[NO_WATERMARK] Image",
+                                                        alt="",
+                                                        proxy=self.proxy,
+                                                        cookies=self.cookies,
+                                                    )
+                                                )
+                                
+                                if debug_mode:
+                                    logger.debug(f"Total extracted after image-to-image path: {len(generated_images)} images")
                         else:
-                            logger.debug("Image mode detected but no image data found in any response part")
+                            if debug_mode:
+                                logger.debug("Image mode detected but no image data found in any response part")
 
                     output_candidates.append(
                         Candidate(

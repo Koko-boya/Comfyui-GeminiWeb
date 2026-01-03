@@ -6,6 +6,16 @@ Custom ComfyUI nodes for **Google Gemini** image generation and editing using th
 ![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-green)
 [![Registry](https://img.shields.io/badge/Comfy-Registry-green)](https://registry.comfy.org/publishers/kokoboy/nodes/comfyui-geminiweb)
 
+> **Security Warning**
+> 
+> This node accesses your browser cookies for authentication. Please be aware:
+> - **Local use only** - Do not run on shared computers or public networks
+> - **Cookie extraction** - The app scans your browser for Google session cookies
+> - **Plain text storage** - Cookies may be stored in memory during session
+> - **No SSL verification** - Requests may not verify SSL certificates
+> 
+> Use at your own risk. Only run this on your personal, private machine.
+
 ## Features
 
 - **Text-to-Image** - Generate images from text using Gemini's native image model

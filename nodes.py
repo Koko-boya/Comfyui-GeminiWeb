@@ -96,6 +96,10 @@ class GeminiWeb:
                     "multiline": False,
                     "tooltip": "__Secure-1PSIDTS (optional)"
                 }),
+                "debug_mode": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Save request/response to debug files"
+                }),
             }
         }
     
@@ -109,11 +113,13 @@ class GeminiWeb:
         """Get or create a cached Gemini client."""
         from .gemini_webapi import GeminiClient
         
-        # Create cache key
+        # Create cache key using hash for uniqueness
         if auth_method == "auto_cookies":
             cache_key = "auto"
         else:
-            cache_key = f"manual:{cookie_1PSID[:20] if cookie_1PSID else 'empty'}"
+            import hashlib
+            cookie_hash = hashlib.md5(cookie_1PSID.encode()).hexdigest()[:16] if cookie_1PSID else "empty"
+            cache_key = f"manual:{cookie_hash}"
         
         # Return cached client if valid
         if cache_key in _client_cache:
@@ -143,7 +149,7 @@ class GeminiWeb:
     def execute(self, mode, prompt, auth_method, 
                 image_1=None, image_2=None, image_3=None, image_4=None, image_5=None,
                 model="gemini-2.5-flash", timeout=120, image_filter="all", 
-                cookie_1PSID="", cookie_1PSIDTS=""):
+                cookie_1PSID="", cookie_1PSIDTS="", debug_mode=False):
         import torch
         
         # Collect all provided images into a list
@@ -153,13 +159,13 @@ class GeminiWeb:
         client = self._get_client(auth_method, cookie_1PSID, cookie_1PSIDTS)
         
         if mode == "text_to_image":
-            return self._text_to_image(client, prompt, model, timeout, image_filter)
+            return self._text_to_image(client, prompt, model, timeout, image_filter, debug_mode)
         elif mode == "image_to_image":
             if not images:
                 raise ValueError("image_to_image mode requires at least one input image")
-            return self._image_to_image(client, images, prompt, model, timeout, image_filter)
+            return self._image_to_image(client, images, prompt, model, timeout, image_filter, debug_mode)
         elif mode == "chat":
-            return self._chat(client, prompt, images, model, timeout)
+            return self._chat(client, prompt, images, model, timeout, debug_mode)
         else:
             raise ValueError(f"Unknown mode: {mode}")
     
@@ -184,7 +190,7 @@ class GeminiWeb:
         
         return filtered if filtered else images  # Fallback to all if filter returns nothing
     
-    def _text_to_image(self, client, prompt, model, timeout=120, image_filter="all"):
+    def _text_to_image(self, client, prompt, model, timeout=120, image_filter="all", debug_mode=False):
         """Generate images from text prompts."""
         import torch
         
@@ -193,7 +199,8 @@ class GeminiWeb:
                 prompt,
                 model=model,
                 image_mode=True,
-                timeout=timeout
+                timeout=timeout,
+                debug_mode=debug_mode
             )
             return response
         
@@ -213,7 +220,7 @@ class GeminiWeb:
         image_tensors = self._download_all_images(filtered_images)
         return (image_tensors, response_text, thinking)
     
-    def _image_to_image(self, client, images, prompt, model, timeout=120, image_filter="all"):
+    def _image_to_image(self, client, images, prompt, model, timeout=120, image_filter="all", debug_mode=False):
         """Edit images using text prompts. Accepts list of image tensors."""
         import torch
         
@@ -233,7 +240,8 @@ class GeminiWeb:
                     files=temp_paths,
                     model=model,
                     image_mode=True,
-                    timeout=timeout
+                    timeout=timeout,
+                    debug_mode=debug_mode
                 )
                 return response
             
@@ -249,7 +257,8 @@ class GeminiWeb:
         
         if not response.images:
             print("[Gemini] No images in response. Response:", response_text[:200] if response_text else "No text")
-            return (image, response_text, thinking)
+            # Return first input image as fallback
+            return (images[0], response_text, thinking)
         
         # Apply image filter (watermark/no_watermark)
         filtered_images = self._filter_images(response.images, image_filter)
@@ -258,7 +267,7 @@ class GeminiWeb:
         image_tensors = self._download_all_images(filtered_images)
         return (image_tensors, response_text, thinking)
     
-    def _chat(self, client, prompt, images, model, timeout=120):
+    def _chat(self, client, prompt, images, model, timeout=120, debug_mode=False):
         """Chat with Gemini, optionally with multiple image inputs."""
         import torch
         
@@ -278,7 +287,8 @@ class GeminiWeb:
                     prompt,
                     files=temp_paths if temp_paths else None,
                     model=model,
-                    timeout=timeout
+                    timeout=timeout,
+                    debug_mode=debug_mode
                 )
                 return response
             
@@ -299,8 +309,8 @@ class GeminiWeb:
             return (image_tensors, response_text, thinking)
         
         # No image output
-        if image is not None:
-            return (image, response_text, thinking)
+        if images:
+            return (images[0], response_text, thinking)
         else:
             placeholder = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
             return (placeholder, response_text, thinking)
@@ -319,7 +329,7 @@ class GeminiWeb:
         
         async def download_all():
             tensors = []
-            for image_obj in image_list:
+            for idx, image_obj in enumerate(image_list):
                 fd, temp_path = tempfile.mkstemp(suffix=".png")
                 os.close(fd)
                 
@@ -329,6 +339,9 @@ class GeminiWeb:
                     pil_img = PILImage.open(temp_path)
                     tensor = pil_to_tensor(pil_img)
                     tensors.append(tensor)
+                except Exception as e:
+                    print(f"[Gemini] Failed to download image {idx + 1}: {e}")
+                    # Continue with other images instead of failing completely
                 finally:
                     if os.path.exists(temp_path):
                         os.remove(temp_path)
@@ -337,6 +350,7 @@ class GeminiWeb:
             if tensors:
                 return torch.cat(tensors, dim=0)
             else:
+                print("[Gemini] Warning: No images could be downloaded, returning placeholder")
                 return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
         
         return run_async(download_all())
