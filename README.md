@@ -4,7 +4,6 @@ Custom ComfyUI nodes for **Google Gemini** image generation and editing using th
 
 ![Gemini](https://img.shields.io/badge/Google-Gemini-blue?logo=google)
 ![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-green)
-[![Registry](https://img.shields.io/badge/Comfy-Registry-green)](https://registry.comfy.org/publishers/kokoboy/nodes/comfyui-geminiweb)
 
 > **Security Warning**
 > 
@@ -15,6 +14,8 @@ Custom ComfyUI nodes for **Google Gemini** image generation and editing using th
 > - **No SSL verification** - Requests may not verify SSL certificates
 > 
 > Use at your own risk. Only run this on your personal, private machine.
+
+> **Note:** This is released as-is with no active maintenance planned. Pull Requests are welcome if you'd like to fix issues or improve the project!
 
 ## Features
 
@@ -48,20 +49,41 @@ pip install -r requirements.txt
 
 ## Authentication Setup
 
-### Option 1: Auto Cookies (Recommended)
+Modern Chrome/Edge (v127+) uses **App-Bound Encryption (v20)** which requires special handling.
 
-1. Login to [gemini.google.com](https://gemini.google.com) in your browser
-2. Use **"auto_cookies"** in the node
-3. The node will automatically extract cookies from your browser
+### Option 1: Manual (Recommended)
 
-### Option 2: Manual Cookies
+The simplest and most reliable method:
 
-1. Go to [gemini.google.com](https://gemini.google.com) and login
-2. Open DevTools (F12) → Application → Cookies
-3. Copy these cookie values:
-   - `__Secure-1PSID` (required)
-   - `__Secure-1PSIDTS` (optional)
-4. Enter values in the node inputs
+1. Login to [gemini.google.com](https://gemini.google.com)
+2. Press **F12** → **Application** → **Cookies** → **gemini.google.com**
+3. Copy `__Secure-1PSID` and `__Secure-1PSIDTS` values
+4. Paste directly into the node's cookie inputs
+
+### Option 2: Cookie File
+
+Store cookies in a file for reuse:
+
+1. Edit `gemini_cookies.txt` in the node folder:
+   ```
+   __Secure-1PSID=your_value_here
+   __Secure-1PSIDTS=your_value_here
+   ```
+2. Use **"cookie_file"** in the node
+
+### Option 3: Auto Cookies (Run as Administrator)
+
+For automatic v20 cookie decryption (**Edge only tested**):
+
+1. **Run ComfyUI as Administrator**
+2. Login to gemini.google.com in **Edge**
+3. **Close the browser completely** (important!)
+   - Make sure the browser is not running in the background
+   - Check Task Manager and end any Edge/Chrome processes
+4. Use **"auto_cookies"** in the node
+
+> **Why Admin?** Chrome/Edge 127+ use App-Bound Encryption (v20) which 
+> requires SYSTEM-level access to decrypt. Currently only Edge is tested.
 
 ## Node: GeminiWeb
 
@@ -73,7 +95,7 @@ Unified node for all Gemini operations.
 |-------|------|-------------|
 | mode | ENUM | `text_to_image`, `image_to_image`, or `chat` |
 | prompt | STRING | Text prompt |
-| auth_method | ENUM | `auto_cookies` or `manual` |
+| auth_method | ENUM | `auto_cookies`, `cookie_file`, or `manual` |
 | image_1 | IMAGE | Primary input image |
 | image_2 | IMAGE | Optional reference image |
 | image_3 | IMAGE | Optional reference image |
@@ -130,25 +152,34 @@ Unified node for all Gemini operations.
 
 | Model | Description |
 |-------|-------------|
-| `unspecified` | Default model |
-| `gemini-3.0-pro` | Latest Pro model |
-| `gemini-2.5-pro` | Pro model |
-| `gemini-2.5-flash` | Fast model (default) |
+| `unspecified` | Default model (uses Gemini's default) |
+| `gemini-3-pro` | Pro model |
+| `gemini-3-thinking` | Thinking model |
+| `gemini-3-flash` | Fast model (default) |
 
 ## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
 | "Cookie expired" | Re-login to gemini.google.com and update cookies |
+| "v20 App-Bound Encryption" | Use `manual` method (recommended) or run as Admin with Edge |
+| "No browser cookies found" | Use `manual` or `cookie_file` method (recommended) |
+| "Cookie file not found" | Create `gemini_cookies.txt` with your cookies |
 | "No images generated" | Try adding "generate" to your prompt |
 | Import errors | Run `pip install -r requirements.txt` |
 | Region restrictions | Image generation may not be available in all regions |
-| "Event loop closed" | Restart ComfyUI |
-| Filter not working | Each generation returns 2 images (watermarked + clean) |
+| v20 not decrypting | Run as Admin + close Edge + PythonForWindows installed |
+
+### Reporting Issues
+
+If you encounter problems, please open an issue with the prompt you used, or enable **debug_mode** in the node and attach the `debug_request.txt` file (found in the node's directory under `custom_nodes/Comfyui-GeminiWeb/`).
+
+> ⚠️ **Do NOT share `debug_response.txt`** — it may contain your location and other personal details from Google.
 
 ## Credits
 
 - Based on [Gemini-API](https://github.com/HanaokaYuzu/Gemini-API) by HanaokaYuzu (vendored)
+- v20 Cookie Decryption based on [chrome_v20_decryption](https://github.com/runassu/chrome_v20_decryption) by runassu
 - ComfyUI Community
 
 ## License

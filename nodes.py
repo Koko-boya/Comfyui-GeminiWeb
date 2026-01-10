@@ -10,9 +10,9 @@ from .utils import tensor_to_pil, pil_to_tensor, bytes_to_tensor, save_temp_imag
 # Available Gemini models
 GEMINI_MODELS = [
     "unspecified",
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
-    "gemini-3.0-pro",
+    "gemini-3-flash",
+    "gemini-3-thinking",
+    "gemini-3-pro",
 ]
 
 # Available modes
@@ -51,9 +51,9 @@ class GeminiWeb:
                     "multiline": True,
                     "tooltip": "Text prompt"
                 }),
-                "auth_method": (["auto_cookies", "manual"], {
+                "auth_method": (["auto_cookies", "cookie_file", "manual"], {
                     "default": "auto_cookies",
-                    "tooltip": "Cookie source"
+                    "tooltip": "Cookie source: auto_cookies (from browser), cookie_file (from gemini_cookies.txt), manual (paste values)"
                 }),
             },
             "optional": {
@@ -73,7 +73,7 @@ class GeminiWeb:
                     "tooltip": "Input image 5 (optional reference)"
                 }),
                 "model": (GEMINI_MODELS, {
-                    "default": "gemini-2.5-flash",
+                    "default": "gemini-3-flash",
                     "tooltip": "Gemini model"
                 }),
                 "timeout": ("INT", {
@@ -113,6 +113,11 @@ class GeminiWeb:
         """Get or create a cached Gemini client."""
         from .gemini_webapi import GeminiClient
         
+        # Handle cookie_file method - read cookies from file
+        if auth_method == "cookie_file":
+            cookie_1PSID, cookie_1PSIDTS = self._load_cookies_from_file()
+            auth_method = "manual"  # Treat as manual after loading
+        
         # Create cache key using hash for uniqueness
         if auth_method == "auto_cookies":
             cache_key = "auto"
@@ -146,9 +151,62 @@ class GeminiWeb:
         _client_cache[cache_key] = client
         return client
     
+    def _load_cookies_from_file(self):
+        """Load cookies from gemini_cookies.txt file.
+        
+        File format:
+        Line 1: __Secure-1PSID value
+        Line 2: __Secure-1PSIDTS value (optional)
+        
+        Or key=value format:
+        __Secure-1PSID=value
+        __Secure-1PSIDTS=value
+        """
+        cookie_file = os.path.join(os.path.dirname(__file__), "gemini_cookies.txt")
+        
+        if not os.path.exists(cookie_file):
+            raise ValueError(
+                f"Cookie file not found: {cookie_file}\n"
+                f"Create gemini_cookies.txt with your cookie values:\n"
+                f"Line 1: __Secure-1PSID value\n"
+                f"Line 2: __Secure-1PSIDTS value (optional)"
+            )
+        
+        with open(cookie_file, 'r', encoding='utf-8') as f:
+            lines = [line.strip() for line in f.readlines() if line.strip() and not line.startswith('#')]
+        
+        cookie_1PSID = ""
+        cookie_1PSIDTS = ""
+        
+        for line in lines:
+            if '=' in line:
+                # Key=value format
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                if key == "__Secure-1PSID" or key == "PSID":
+                    cookie_1PSID = value
+                elif key == "__Secure-1PSIDTS" or key == "PSIDTS":
+                    cookie_1PSIDTS = value
+            elif not cookie_1PSID:
+                # First non-key=value line is PSID
+                cookie_1PSID = line
+            elif not cookie_1PSIDTS:
+                # Second non-key=value line is PSIDTS
+                cookie_1PSIDTS = line
+        
+        if not cookie_1PSID:
+            raise ValueError(
+                f"No __Secure-1PSID found in {cookie_file}\n"
+                f"Make sure the file contains your cookie values."
+            )
+        
+        print(f"[Gemini] Loaded cookies from {cookie_file}")
+        return cookie_1PSID, cookie_1PSIDTS
+    
     def execute(self, mode, prompt, auth_method, 
                 image_1=None, image_2=None, image_3=None, image_4=None, image_5=None,
-                model="gemini-2.5-flash", timeout=120, image_filter="all", 
+                model="gemini-3-flash", timeout=120, image_filter="all", 
                 cookie_1PSID="", cookie_1PSIDTS="", debug_mode=False):
         import torch
         
@@ -254,6 +312,9 @@ class GeminiWeb:
         
         response_text = response.text if response.text else ""
         thinking = self._get_thinking(response)
+        
+        # Debug: Print extracted text
+        print(f"[Gemini Debug] Extracted response_text: '{response_text[:100] if response_text else 'EMPTY'}...'")
         
         if not response.images:
             print("[Gemini] No images in response. Response:", response_text[:200] if response_text else "No text")

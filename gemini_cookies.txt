@@ -1,0 +1,24 @@
+# Gemini Cookie File
+# ====================
+# To use this, get your cookies from Edge/Chrome:
+# 1. Open Edge/Chrome and go to https://gemini.google.com
+# 2. Press F12 to open DevTools
+# 3. Go to Application tab > Cookies > https://gemini.google.com
+# 4. Copy the values of __Secure-1PSID and __Secure-1PSIDTS
+# 5. Paste them below (replace the placeholder values)
+#
+# Format Options:
+# Option 1 - Key=Value format:
+#   __Secure-1PSID=your_value_here
+#   __Secure-1PSIDTS=your_value_here
+#
+# Option 2 - Simple format (one value per line):
+#   your_1PSID_value_here
+#   your_1PSIDTS_value_here
+#
+# NOTE: These cookies expire! If you get auth errors, update the values.
+# ====================
+
+# Paste your cookies below:
+__Secure-1PSID=PASTE_YOUR_1PSID_VALUE_HERE
+__Secure-1PSIDTS=PASTE_YOUR_1PSIDTS_VALUE_HERE

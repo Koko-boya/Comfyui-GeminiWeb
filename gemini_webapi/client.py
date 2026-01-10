@@ -316,13 +316,13 @@ class GeminiClient(GemMixin):
             session_uuid = str(uuid.uuid4()).upper()
             
             # For image mode, build header with correct extended format
-            # Image mode REQUIRES a valid model ID - default to gemini-2.5-flash if unspecified
+            # Image mode REQUIRES a valid model ID - default to gemini-3-flash if unspecified
             model_header_str = model.model_header.get("x-goog-ext-525001261-jspb", "")
             if '"' in model_header_str:
                 # Extract model ID from existing header
                 model_id = model_header_str.split('"')[1]
             else:
-                # Default to gemini-2.5-flash model ID for image mode
+                # Default to gemini-3-flash model ID for image mode
                 model_id = "9ec249fc9ad08861"  # G_2_5_FLASH model ID
             
             final_headers["x-goog-ext-525001261-jspb"] = f'[1,null,null,null,"{model_id}",null,null,0,[4],null,null,2]'
@@ -461,6 +461,11 @@ class GeminiClient(GemMixin):
             try:
                 response_json = extract_json_from_response(response.text)
 
+                # Find the best body - look for the chunk with actual text content
+                # Streaming responses have multiple chunks; early ones may have empty text
+                best_body = None
+                best_body_index = 0
+                
                 for part_index, part in enumerate(response_json):
                     try:
                         part_body = get_nested_value(part, [2])
@@ -468,11 +473,30 @@ class GeminiClient(GemMixin):
                             continue
 
                         part_json = json.loads(part_body)
-                        if get_nested_value(part_json, [4]):
-                            body_index, body = part_index, part_json
-                            break
+                        candidates = get_nested_value(part_json, [4])
+                        if candidates:
+                            # Check if this chunk has actual text content
+                            text_content = get_nested_value(candidates, [0, 1, 0], "")
+                            
+                            if debug_mode:
+                                logger.debug(f"Part {part_index}: text_content = '{text_content[:50] if text_content else 'None'}...'")
+                            
+                            # Prefer chunks with text, but keep any valid candidate as fallback
+                            if text_content and text_content.strip():
+                                best_body = part_json
+                                best_body_index = part_index
+                            elif best_body is None:
+                                best_body = part_json
+                                best_body_index = part_index
                     except json.JSONDecodeError:
                         continue
+
+                if debug_mode:
+                    final_text = get_nested_value(best_body, [4, 0, 1, 0], "") if best_body else "None"
+                    logger.debug(f"Selected body index {best_body_index}, text: '{final_text[:100] if final_text else 'None'}...'")
+                
+                body = best_body if best_body else []
+                body_index = best_body_index
 
                 if not body:
                     raise Exception
@@ -641,11 +665,14 @@ class GeminiClient(GemMixin):
                             if finished_text := get_nested_value(
                                 img_candidate, [1, 0]
                             ):  # Only overwrite if new text is returned after image generation
-                                text = re.sub(
+                                processed_text = re.sub(
                                     r"http://googleusercontent\.com/image_generation_content/\d+",
                                     "",
                                     finished_text,
                                 ).rstrip()
+                                # Only use processed text if it has actual content
+                                if processed_text and processed_text.strip():
+                                    text = processed_text
 
                             for img_index, gen_img_data in enumerate(
                                 get_nested_value(img_candidate, [12, 7, 0], [])
@@ -659,15 +686,19 @@ class GeminiClient(GemMixin):
                                                 logger.debug(f"  gen_img_data[{img_index}][{i}] = {str(item)[:150]}")
                                 
                                 # Images can be at multiple paths within each gen_img_data:
-                                # - First image: [0][3][3] → gen_img_data[0][3] is first image data
-                                # - Second image: [0][6][3] → gen_img_data[0][6] is second image data (at index 6!)
-                                # The structure is: [[null,null,null,[img1],null,null,[img2],...],...]
+                                # Structure varies - the images are in an array with PNG at [3] and JPEG at [6]
+                                # within various nesting levels. URLs are at the [3] position within those arrays.
                                 
                                 image_paths = [
-                                    [0, 3, 3],    # First image: gen_img_data[0][3][3]
-                                    [0, 6, 3],    # Second image: gen_img_data[0][6][3] (index 6!)
-                                    [0, 0, 3, 3], # Alternative nested path
-                                    [0, 0, 6, 3], # Alternative for second image
+                                    # Deepest paths first (most common in recent responses)
+                                    [0, 0, 3, 3],    # PNG: gen_img_data[0][0][3][3]
+                                    [0, 0, 6, 3],    # JPEG: gen_img_data[0][0][6][3]
+                                    # Alternative shallower paths  
+                                    [0, 3, 3],       # PNG: gen_img_data[0][3][3]
+                                    [0, 6, 3],       # JPEG: gen_img_data[0][6][3]
+                                    # Even shallower
+                                    [3, 3],          # gen_img_data[3][3]
+                                    [6, 3],          # gen_img_data[6][3]
                                 ]
                                 
 
@@ -726,29 +757,30 @@ class GeminiClient(GemMixin):
                                 logger.debug(f"Extracted {len(generated_images)} generated images from standard path")
                             
                             # Fallback: If no images found via standard paths, search in candidate[12][6]
-                            # Image-to-image responses have images at [12][6][1][0][0][0][3] (PNG) and [12][6][1][0][0][3] (JPEG)
+                            # Image-to-image responses have images at [12][6][1][0][0][0][3] (PNG array) and [12][6][1][0][0][0][6] (JPEG array)
+                            # Within each array: [null, 1, "filename", "url", ...]
                             if not generated_images and img_candidate:
                                 if debug_mode:
                                     logger.debug("No images from standard path, searching image-to-image path in candidate[12][6]...")
                                 
-                                # Image-to-image structure: candidate[12][6] = [2, [[[[null,null,null,PNG],null,null,JPEG]...]]]
+                                # Image-to-image structure: candidate[12][6] = [status, [[[[null,null,null,[png_data],null,null,[jpeg_data]]...]]]]
                                 img_edit_data = get_nested_value(img_candidate, [12, 6], None)
                                 if img_edit_data and isinstance(img_edit_data, list) and len(img_edit_data) > 1:
-                                    # Path to images: [12][6][1][0][0][0] contains the image array
-                                    img_array = get_nested_value(img_edit_data, [1, 0, 0, 0], None)
+                                    # Path to image container: [12][6][1][0][0][0]
+                                    img_container = get_nested_value(img_edit_data, [1, 0, 0, 0], None)
                                     
-                                    if img_array and isinstance(img_array, list):
+                                    if img_container and isinstance(img_container, list):
                                         if debug_mode:
-                                            logger.debug(f"Found image array at [12][6][1][0][0][0], len: {len(img_array)}")
+                                            logger.debug(f"Found image container at [12][6][1][0][0][0], len: {len(img_container)}")
                                         
-                                        # PNG is at position 3: [null, null, null, [null,1,"file.png","url",...]]
-                                        png_data = get_nested_value(img_array, [3], None)
+                                        # PNG is at position 3: img_container[3] = [null, 1, "filename.png", "url", ...]
+                                        png_data = get_nested_value(img_container, [3], None)
                                         if png_data and isinstance(png_data, list) and len(png_data) > 3:
-                                            url = png_data[3] if len(png_data) > 3 else None
+                                            url = png_data[3]
                                             filename = png_data[2] if len(png_data) > 2 else ""
-                                            if url and isinstance(url, str) and url.startswith("http") and "gg-dl" in url:
+                                            if url and isinstance(url, str) and url.startswith("http"):
                                                 if debug_mode:
-                                                    logger.debug(f"Found PNG at [12][6][1][0][0][0][3]: {url[:80]}...")
+                                                    logger.debug(f"Found PNG at [12][6][1][0][0][0][3][3]: {url[:80]}...")
                                                 generated_images.append(
                                                     GeneratedImage(
                                                         url=url,
@@ -759,14 +791,14 @@ class GeminiClient(GemMixin):
                                                     )
                                                 )
                                         
-                                        # JPEG is at parent level position 3: get_nested_value([12][6][1][0][0], [3])
-                                        jpeg_container = get_nested_value(img_edit_data, [1, 0, 0, 3], None)
-                                        if jpeg_container and isinstance(jpeg_container, list) and len(jpeg_container) > 3:
-                                            url = jpeg_container[3] if len(jpeg_container) > 3 else None
-                                            filename = jpeg_container[2] if len(jpeg_container) > 2 else ""
-                                            if url and isinstance(url, str) and url.startswith("http") and "gg-dl" in url:
+                                        # JPEG is at position 6: img_container[6] = [null, 1, "filename.jpeg", "url", ...]
+                                        jpeg_data = get_nested_value(img_container, [6], None)
+                                        if jpeg_data and isinstance(jpeg_data, list) and len(jpeg_data) > 3:
+                                            url = jpeg_data[3]
+                                            filename = jpeg_data[2] if len(jpeg_data) > 2 else ""
+                                            if url and isinstance(url, str) and url.startswith("http"):
                                                 if debug_mode:
-                                                    logger.debug(f"Found JPEG at [12][6][1][0][0][3]: {url[:80]}...")
+                                                    logger.debug(f"Found JPEG at [12][6][1][0][0][0][6][3]: {url[:80]}...")
                                                 generated_images.append(
                                                     GeneratedImage(
                                                         url=url,

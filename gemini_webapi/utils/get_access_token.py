@@ -126,8 +126,9 @@ async def get_access_token(
     # Browser cookies (if browser-cookie3 is installed)
     try:
         valid_browser_cookies = 0
+        # Use '.google.com' to match all Google subdomains (gemini.google.com, etc.)
         browser_cookies = load_browser_cookies(
-            domain_name="google.com", verbose=verbose
+            domain_name=".google.com", verbose=verbose
         )
         if browser_cookies:
             for browser, cookies in browser_cookies.items():

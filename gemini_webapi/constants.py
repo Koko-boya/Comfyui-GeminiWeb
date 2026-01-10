@@ -59,7 +59,7 @@ class Headers(Enum):
 class Model(Enum):
     UNSPECIFIED = ("unspecified", {}, False)
     G_3_0_PRO = (
-        "gemini-3.0-pro",
+        "gemini-3-pro",
         {
             "x-goog-ext-525001261-jspb": '[1,null,null,null,"e6fa609c3fa255c0",null,null,0,[4],null,null,2]',
             "x-goog-ext-73010989-jspb": "[0]",
@@ -67,7 +67,7 @@ class Model(Enum):
         False,
     )
     G_2_5_PRO = (
-        "gemini-2.5-pro",
+        "gemini-3-thinking",
         {
             "x-goog-ext-525001261-jspb": '[1,null,null,null,"4af6c7f5da75d65d",null,null,0,[4],null,null,2]',
             "x-goog-ext-73010989-jspb": "[0]",
@@ -75,7 +75,7 @@ class Model(Enum):
         False,
     )
     G_2_5_FLASH = (
-        "gemini-2.5-flash",
+        "gemini-3-flash",
         {
             "x-goog-ext-525001261-jspb": '[1,null,null,null,"9ec249fc9ad08861",null,null,0,[4],null,null,2]',
             "x-goog-ext-73010989-jspb": "[0]",
