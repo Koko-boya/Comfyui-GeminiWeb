@@ -1,13 +1,14 @@
 from pathlib import Path
 
 from httpx import AsyncClient
-from pydantic import validate_call
 
 from ..constants import Endpoint, Headers
 
 
-@validate_call
-async def upload_file(file: str | Path, proxy: str | None = None) -> str:
+async def upload_file(
+    file: str | Path,
+    proxy: str | None = None,
+) -> str:
     """
     Upload a file to Google's server and return its identifier.
 
@@ -39,7 +40,8 @@ async def upload_file(file: str | Path, proxy: str | None = None) -> str:
     with open(file_path, "rb") as f:
         file_content = f.read()
 
-    async with AsyncClient(proxy=proxy) as client:
+    # Upload needs its own client with clean headers (not Gemini headers)
+    async with AsyncClient(proxy=proxy, http2=True) as client:
         response = await client.post(
             url=Endpoint.UPLOAD.value,
             headers=Headers.UPLOAD.value,

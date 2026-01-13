@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 
 from httpx import AsyncClient, HTTPError
 from pydantic import BaseModel, field_validator
@@ -42,6 +43,7 @@ class Image(BaseModel):
         cookies: dict | None = None,
         verbose: bool = False,
         skip_invalid_filename: bool = False,
+        http_client: Optional[AsyncClient] = None,
     ) -> str | None:
         """
         Save the image to disk.
@@ -58,6 +60,8 @@ class Image(BaseModel):
             If True, will print the path of the saved file or warning for invalid file name, by default False.
         skip_invalid_filename: `bool`, optional
             If True, will only save the image if the file name and extension are valid, by default False.
+        http_client: `AsyncClient`, optional
+            Existing httpx client to reuse for connection pooling.
 
         Returns
         -------
@@ -80,9 +84,7 @@ class Image(BaseModel):
             if skip_invalid_filename:
                 return None
 
-        async with AsyncClient(
-            follow_redirects=True, cookies=cookies, proxy=self.proxy
-        ) as client:
+        async def do_download(client: AsyncClient) -> str | None:
             response = await client.get(self.url)
             if response.status_code == 200:
                 content_type = response.headers.get("content-type")
@@ -91,10 +93,10 @@ class Image(BaseModel):
                         f"Content type of {filename} is not image, but {content_type}."
                     )
 
-                path = Path(path)
-                path.mkdir(parents=True, exist_ok=True)
+                dest_path = Path(path)
+                dest_path.mkdir(parents=True, exist_ok=True)
 
-                dest = path / filename
+                dest = dest_path / filename
                 dest.write_bytes(response.content)
 
                 if verbose:
@@ -105,6 +107,16 @@ class Image(BaseModel):
                 raise HTTPError(
                     f"Error downloading image: {response.status_code} {response.reason_phrase}"
                 )
+
+        if http_client:
+            # Reuse existing client for connection pooling
+            return await do_download(http_client)
+        else:
+            # Fallback: create new client
+            async with AsyncClient(
+                follow_redirects=True, cookies=cookies, proxy=self.proxy, http2=True
+            ) as new_client:
+                return await do_download(new_client)
 
 
 class WebImage(Image):
@@ -146,6 +158,7 @@ class GeneratedImage(Image):
         verbose: bool = False,
         skip_invalid_filename: bool = False,
         full_size: bool = True,
+        http_client: Optional[AsyncClient] = None,
     ) -> str | None:
         """
         Save the image to disk.
@@ -165,6 +178,8 @@ class GeneratedImage(Image):
             If True, will only save the image if the file name and extension are valid, by default False.
         full_size: `bool`, optional
             If True, will modify the default preview (512*512) URL to get the full size image, by default True.
+        http_client: `AsyncClient`, optional
+            Existing httpx client to reuse for connection pooling.
 
         Returns
         -------
@@ -182,4 +197,5 @@ class GeneratedImage(Image):
             cookies=cookies or self.cookies,
             verbose=verbose,
             skip_invalid_filename=skip_invalid_filename,
+            http_client=http_client,
         )

@@ -200,7 +200,7 @@ def extract_cookies_from_db(cookie_file: Path, key: bytes, domain_filter: str = 
     return cookies
 
 
-def load_browser_cookies(domain_name: str = "", verbose: bool = True) -> dict:
+def load_browser_cookies(domain_name: str = "", verbose: bool = True) -> tuple[dict, str]:
     """
     Load cookies from all supported browsers on Windows.
     
@@ -216,26 +216,27 @@ def load_browser_cookies(domain_name: str = "", verbose: bool = True) -> dict:
         
     Returns
     -------
-    dict[str, dict]
-        Dictionary with browser/profile as keys and cookie dicts as values.
+    tuple[dict[str, dict], str]
+        Tuple of (cookies dict, failure_reason string).
+        failure_reason is empty if cookies were found successfully.
     """
     if platform.system() != "Windows":
         # Fall back to browser_cookie3 on non-Windows
-        return _load_browser_cookies_fallback(domain_name, verbose)
+        cookies = _load_browser_cookies_fallback(domain_name, verbose)
+        return (cookies, "" if cookies else "Non-Windows platform, browser_cookie3 fallback failed.")
     
     cookies = {}
     browsers_checked = []
+    failure_reason = ""
     
     # Check for required dependencies
     try:
         import win32crypt
     except ImportError:
+        reason = "pywin32 not installed. Install with: pip install pywin32"
         if verbose:
-            logger.warning(
-                "pywin32 not installed. Install with: pip install pywin32. "
-                "Falling back to cookie_file or manual mode."
-            )
-        return {}
+            logger.warning(reason)
+        return ({}, reason)
     
     try:
         from Cryptodome.Cipher import AES
@@ -243,12 +244,10 @@ def load_browser_cookies(domain_name: str = "", verbose: bool = True) -> dict:
         try:
             from Crypto.Cipher import AES
         except ImportError:
+            reason = "pycryptodomex not installed. Install with: pip install pycryptodomex"
             if verbose:
-                logger.warning(
-                    "pycryptodomex not installed. Install with: pip install pycryptodomex. "
-                    "Falling back to cookie_file or manual mode."
-                )
-            return {}
+                logger.warning(reason)
+            return ({}, reason)
     
     browser_paths = get_chromium_browser_paths()
     
@@ -300,42 +299,49 @@ def load_browser_cookies(domain_name: str = "", verbose: bool = True) -> dict:
                 if verbose:
                     logger.debug(f"Error reading {browser_name}/{profile_name}: {e}")
     
-    if verbose:
-        if cookies:
+    if cookies:
+        if verbose:
             logger.debug(f"Successfully loaded cookies from: {list(cookies.keys())}")
-        else:
-            # Try v20 decryption if running as admin
-            try:
-                from .v20_decrypt import check_dependencies, extract_edge_cookies
-                deps = check_dependencies()
-                
-                if deps["can_decrypt"]:
-                    logger.info("Attempting v20 decryption (running as admin)...")
-                    v20_cookies = extract_edge_cookies("google.com")
-                    
-                    if "__Secure-1PSID" in v20_cookies:
-                        cookies["edge_v20"] = v20_cookies
-                        logger.info(f"Successfully decrypted v20 cookies!")
-                else:
-                    if not deps["is_admin"]:
-                        logger.warning(
-                            f"No Gemini cookies extracted. Checked: {', '.join(browsers_checked)}. "
-                            f"Edge/Chrome 127+ uses App-Bound Encryption (v20). "
-                            f"Run as Administrator to decrypt, or use 'cookie_file' method."
-                        )
-                    else:
-                        logger.warning(
-                            f"No cookies found. Missing deps: PythonForWindows or pycryptodomex. "
-                            f"Use 'cookie_file' or 'manual' auth method."
-                        )
-            except ImportError:
-                logger.warning(
-                    f"No Gemini cookies extracted. Checked: {', '.join(browsers_checked)}. "
-                    f"Edge/Chrome 127+ uses App-Bound Encryption (v20) which cannot be decrypted externally. "
-                    f"Use 'cookie_file' or 'manual' auth method instead."
-                )
+        return (cookies, "")
     
-    return cookies
+    # No cookies found - try v20 decryption and build failure reason
+    try:
+        from .v20_decrypt import check_dependencies, extract_edge_cookies
+        deps = check_dependencies()
+        
+        if deps["can_decrypt"]:
+            if verbose:
+                logger.info("Attempting v20 decryption (running as admin)...")
+            v20_cookies = extract_edge_cookies("google.com")
+            
+            if "__Secure-1PSID" in v20_cookies:
+                cookies["edge_v20"] = v20_cookies
+                if verbose:
+                    logger.info(f"Successfully decrypted v20 cookies!")
+                return (cookies, "")
+        
+        if not deps["is_admin"]:
+            failure_reason = (
+                f"Edge/Chrome 127+ uses App-Bound Encryption (v20). "
+                f"You are NOT running ComfyUI as Administrator. "
+                f"Either run ComfyUI as Administrator (right-click -> Run as administrator), "
+                f"or use the 'manual' or 'cookie_file' auth method instead."
+            )
+        else:
+            failure_reason = (
+                f"Running as Admin but missing dependencies for v20 decryption. "
+                f"Use 'cookie_file' or 'manual' auth method."
+            )
+    except ImportError:
+        failure_reason = (
+            f"Edge/Chrome 127+ uses App-Bound Encryption (v20) which cannot be decrypted externally. "
+            f"Use 'cookie_file' or 'manual' auth method instead."
+        )
+    
+    if verbose and failure_reason:
+        logger.warning(f"No Gemini cookies extracted. Checked: {', '.join(browsers_checked)}. {failure_reason}")
+    
+    return (cookies, failure_reason)
 
 
 def _load_browser_cookies_fallback(domain_name: str = "", verbose: bool = True) -> dict:

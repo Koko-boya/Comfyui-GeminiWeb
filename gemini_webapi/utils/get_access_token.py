@@ -124,10 +124,11 @@ async def get_access_token(
             )
 
     # Browser cookies (if browser-cookie3 is installed)
+    browser_failure_reason = ""
     try:
         valid_browser_cookies = 0
         # Use '.google.com' to match all Google subdomains (gemini.google.com, etc.)
-        browser_cookies = load_browser_cookies(
+        browser_cookies, browser_failure_reason = load_browser_cookies(
             domain_name=".google.com", verbose=verbose
         )
         if browser_cookies:
@@ -168,9 +169,15 @@ async def get_access_token(
             logger.warning(f"Skipping loading local browser cookies. {e}")
 
     if not tasks:
-        raise AuthError(
-            "No valid cookies available for initialization. Please pass __Secure-1PSID and __Secure-1PSIDTS manually."
-        )
+        # Include the detailed browser failure reason if available
+        if browser_failure_reason:
+            raise AuthError(
+                f"Cookie Authentication Failed!\n\n{browser_failure_reason}"
+            )
+        else:
+            raise AuthError(
+                "No valid cookies available for initialization. Please pass __Secure-1PSID and __Secure-1PSIDTS manually."
+            )
 
     for i, future in enumerate(asyncio.as_completed(tasks)):
         try:

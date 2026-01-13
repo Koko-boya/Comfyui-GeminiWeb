@@ -6,6 +6,7 @@ Single node that handles authentication and all operations.
 
 import os
 from .utils import tensor_to_pil, pil_to_tensor, bytes_to_tensor, save_temp_image, run_async
+from .gemini_webapi.utils import logger
 
 # Available Gemini models
 GEMINI_MODELS = [
@@ -147,7 +148,16 @@ class GeminiWeb:
             await client.init(timeout=60, auto_close=False, auto_refresh=True)
             return client
         
-        client = run_async(init_client())
+        try:
+            client = run_async(init_client())
+        except Exception as e:
+            error_msg = str(e)
+            # Check for common auth errors and provide user-friendly messages
+            if "No valid cookies available" in error_msg or "Cookie Authentication Failed" in error_msg or "AuthError" in type(e).__name__:
+                # Pass through the detailed error message from the exception
+                raise ValueError(error_msg) from None
+            else:
+                raise
         _client_cache[cache_key] = client
         return client
     
@@ -201,7 +211,7 @@ class GeminiWeb:
                 f"Make sure the file contains your cookie values."
             )
         
-        print(f"[Gemini] Loaded cookies from {cookie_file}")
+        logger.info(f"Loaded cookies from {cookie_file}")
         return cookie_1PSID, cookie_1PSIDTS
     
     def execute(self, mode, prompt, auth_method, 
@@ -267,13 +277,13 @@ class GeminiWeb:
         thinking = self._get_thinking(response)
         
         if not response.images:
-            print("[Gemini] No images generated. Response:", response_text[:200] if response_text else "No text")
+            logger.info(f"No images generated. Response: {response_text[:200] if response_text else 'No text'}")
             placeholder = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
             return (placeholder, response_text, thinking)
         
         # Apply image filter (watermark/no_watermark)
         filtered_images = self._filter_images(response.images, image_filter)
-        print(f"[Gemini] Total: {len(response.images)} images, after filter '{image_filter}': {len(filtered_images)} images")
+        logger.info(f"Total: {len(response.images)} images, after filter '{image_filter}': {len(filtered_images)} images")
         
         image_tensors = self._download_all_images(filtered_images)
         return (image_tensors, response_text, thinking)
@@ -286,7 +296,7 @@ class GeminiWeb:
         
         try:
             # Save all input images to temp files
-            print(f"[Gemini] Processing {len(images)} input image(s)")
+            logger.info(f"Processing {len(images)} input image(s)")
             for img_tensor in images:
                 pil_image = tensor_to_pil(img_tensor)
                 temp_path = save_temp_image(pil_image)
@@ -313,17 +323,16 @@ class GeminiWeb:
         response_text = response.text if response.text else ""
         thinking = self._get_thinking(response)
         
-        # Debug: Print extracted text
-        print(f"[Gemini Debug] Extracted response_text: '{response_text[:100] if response_text else 'EMPTY'}...'")
+        logger.debug(f"Extracted response_text: '{response_text[:100] if response_text else 'EMPTY'}...'")
         
         if not response.images:
-            print("[Gemini] No images in response. Response:", response_text[:200] if response_text else "No text")
+            logger.info(f"No images in response. Response: {response_text[:200] if response_text else 'No text'}")
             # Return first input image as fallback
             return (images[0], response_text, thinking)
         
         # Apply image filter (watermark/no_watermark)
         filtered_images = self._filter_images(response.images, image_filter)
-        print(f"[Gemini] Total: {len(response.images)} images, after filter '{image_filter}': {len(filtered_images)} images")
+        logger.info(f"Total: {len(response.images)} images, after filter '{image_filter}': {len(filtered_images)} images")
         
         image_tensors = self._download_all_images(filtered_images)
         return (image_tensors, response_text, thinking)
@@ -337,7 +346,7 @@ class GeminiWeb:
         try:
             # Save all input images to temp files
             if images:
-                print(f"[Gemini] Chat with {len(images)} image(s)")
+                logger.info(f"Chat with {len(images)} image(s)")
                 for img_tensor in images:
                     pil_image = tensor_to_pil(img_tensor)
                     temp_path = save_temp_image(pil_image)
@@ -365,7 +374,7 @@ class GeminiWeb:
         
         # Check if there are images in response
         if response.images:
-            print(f"[Gemini] Generated {len(response.images)} image(s)")
+            logger.info(f"Generated {len(response.images)} image(s)")
             image_tensors = self._download_all_images(response.images)
             return (image_tensors, response_text, thinking)
         
@@ -401,7 +410,7 @@ class GeminiWeb:
                     tensor = pil_to_tensor(pil_img)
                     tensors.append(tensor)
                 except Exception as e:
-                    print(f"[Gemini] Failed to download image {idx + 1}: {e}")
+                    logger.warning(f"Failed to download image {idx + 1}: {e}")
                     # Continue with other images instead of failing completely
                 finally:
                     if os.path.exists(temp_path):
@@ -411,7 +420,7 @@ class GeminiWeb:
             if tensors:
                 return torch.cat(tensors, dim=0)
             else:
-                print("[Gemini] Warning: No images could be downloaded, returning placeholder")
+                logger.warning("No images could be downloaded, returning placeholder")
                 return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
         
         return run_async(download_all())

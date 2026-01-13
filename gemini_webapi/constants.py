@@ -129,3 +129,16 @@ class ErrorCode(IntEnum):
     MODEL_HEADER_INVALID = 1052
     IP_TEMPORARILY_BLOCKED = 1060
 
+
+class ImageStatus(IntEnum):
+    """
+    Status codes for image generation response parsing.
+    Found at candidate[12][6][0] in the response structure.
+    """
+
+    PENDING = 1          # Image generation started
+    IN_PROGRESS = 2      # Image generation in progress  
+    COMPLETE = 3         # Image generation complete, images available
+    SAFETY_BLOCKED = 4   # Blocked by safety filters
+    ERROR = 5            # Generation failed
+
