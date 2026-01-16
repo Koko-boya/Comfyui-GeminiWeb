@@ -316,19 +316,32 @@ class GeminiClient(GemMixin):
             import uuid
             session_uuid = str(uuid.uuid4()).upper()
             
-            # For image mode, build header with correct extended format
-            # Image mode REQUIRES a valid model ID - default to gemini-3-flash if unspecified
-            model_header_str = model.model_header.get("x-goog-ext-525001261-jspb", "")
-            if '"' in model_header_str:
-                # Extract model ID from existing header
-                model_id = model_header_str.split('"')[1]
-            else:
-                # Default to gemini-3-flash model ID for image mode
-                model_id = "9ec249fc9ad08861"  # G_2_5_FLASH model ID
+            # Image mode has two sub-cases:
+            # 1. Text-to-image (no files): Use extended headers with model ID and session UUID
+            # 2. Image-to-image (with files): Use standard model headers only
+            #    The extended headers cause i2i requests to return empty responses
             
-            final_headers["x-goog-ext-525001261-jspb"] = f'[1,null,null,null,"{model_id}",null,null,0,[4],null,null,2]'
-            final_headers["x-goog-ext-525005358-jspb"] = f'["{session_uuid}",1]'
-            # Note: x-goog-ext-73010989-jspb is now included in base GEMINI headers
+            if files:
+                # Image-to-Image: Use standard model headers (matches upstream Gemini-API)
+                logger.debug(f"Image mode (i2i): Using standard model headers for editing")
+                if model.model_header:
+                    final_headers = {**model.model_header}
+            else:
+                # Text-to-Image: Use extended headers with model ID and session UUID
+                # Image mode REQUIRES a valid model ID - default to gemini-3-flash if unspecified
+                model_header_str = model.model_header.get("x-goog-ext-525001261-jspb", "")
+                if '"' in model_header_str:
+                    # Extract model ID from existing header
+                    model_id = model_header_str.split('"')[1]
+                else:
+                    # Default to gemini-3-flash model ID for image mode
+                    model_id = "9ec249fc9ad08861"  # G_2_5_FLASH model ID
+                
+                final_headers["x-goog-ext-525001261-jspb"] = f'[1,null,null,null,"{model_id}",null,null,0,[4],null,null,2]'
+                final_headers["x-goog-ext-525005358-jspb"] = f'["{session_uuid}",1]'
+                # Note: x-goog-ext-73010989-jspb is now included in base GEMINI headers
+                
+                logger.debug(f"Image mode (t2i): model_name='{model.model_name}', model_id='{model_id}'")
         else:
             # Non-image mode: use model headers if specified
             session_uuid = None  # No session UUID needed for text mode
@@ -369,39 +382,58 @@ class GeminiClient(GemMixin):
             chat_metadata = chat.metadata if chat else ["", "", "", None, None, None, None, None, None, ""]
             
             if image_mode:
-                # Image mode: Build a 67-element array matching HAR structure
-                # Payload Structure Documentation:
-                #   [0]  = prompt_data: User prompt with optional file attachments
-                #   [1]  = ["en"]: Language setting
-                #   [2]  = chat_metadata: [cid, rid, rcid, ...] for conversation continuity
-                #   [7]  = 1: Enable image generation mode
-                #   [10] = 1: Secondary image mode flag
-                #   [17] = [[0]]: Image mode indicator array
-                #   [27] = 1: Required flag for image processing
-                #   [30] = [4]: Image format preference (4 = standard)
-                #   [41] = [1]: Required processing flag
-                #   [49] = 14: Image generation operation type
-                #   [59] = session_uuid: Unique session identifier
-                #   [66] = [timestamp_sec, timestamp_ns]: Request timestamp
-                import time
-                current_time = int(time.time())
-                timestamp_ns = int((time.time() % 1) * 1000000000)
+                # Image mode has two sub-cases:
+                # 1. Text-to-image (no files): Use 67-element array with image generation flags
+                # 2. Image-to-image (with files): Use simpler structure matching upstream Gemini-API
+                #    The complex array structure breaks when files are attached
                 
-                image_mode_values = {
-                    0: prompt_data,
-                    1: ["en"],
-                    2: chat_metadata,
-                    7: 1,
-                    10: 1,
-                    17: [[0]],
-                    27: 1,
-                    30: [4],
-                    41: [1],
-                    49: 14,
-                    59: session_uuid,
-                    66: [current_time, timestamp_ns],
-                }
-                inner_payload = build_payload(67, image_mode_values)
+                if files:
+                    # Image-to-Image: Use simpler payload structure (matches upstream Gemini-API)
+                    # This format works for editing images with prompts
+                    logger.debug(f"Image mode (i2i): Using simple payload with {len(files)} file(s)")
+                    inner_payload = [
+                        prompt_data,  # [prompt, 0, None, [[file_data], filename], None, None, 0]
+                        None,
+                        chat_metadata,
+                    ]
+                    # Append gem_id if provided
+                    if gem_id:
+                        inner_payload.extend([None] * 16 + [gem_id])
+                else:
+                    # Text-to-Image: Use 67-element array with image generation flags
+                    # Payload Structure Documentation:
+                    #   [0]  = prompt_data: User prompt with optional file attachments
+                    #   [1]  = ["en"]: Language setting
+                    #   [2]  = chat_metadata: [cid, rid, rcid, ...] for conversation continuity
+                    #   [7]  = 1: Enable image generation mode
+                    #   [10] = 1: Secondary image mode flag
+                    #   [17] = [[0]]: Image mode indicator array
+                    #   [27] = 1: Required flag for image processing
+                    #   [30] = [4]: Image format preference (4 = standard)
+                    #   [41] = [1]: Required processing flag
+                    #   [49] = 14: Image generation operation type
+                    #   [59] = session_uuid: Unique session identifier
+                    #   [66] = [timestamp_sec, timestamp_ns]: Request timestamp
+                    import time
+                    current_time = int(time.time())
+                    timestamp_ns = int((time.time() % 1) * 1000000000)
+                    
+                    logger.debug(f"Image mode (t2i): Using 67-element payload for generation")
+                    image_mode_values = {
+                        0: prompt_data,
+                        1: ["en"],
+                        2: chat_metadata,
+                        7: 1,
+                        10: 1,
+                        17: [[0]],
+                        27: 1,
+                        30: [4],
+                        41: [1],
+                        49: 14,
+                        59: session_uuid,
+                        66: [current_time, timestamp_ns],
+                    }
+                    inner_payload = build_payload(67, image_mode_values)
             else:
                 # Text mode: Simpler payload structure
                 text_mode_values = {
@@ -707,11 +739,14 @@ class GeminiClient(GemMixin):
                     generated_images = []
                     
                     # Helper: Recursive image blob finder
-                    def find_image_blobs(node, depth=0, max_depth=12, input_urls=None):
+                    def find_image_blobs(node, depth=0, max_depth=12, input_urls=None, parent_index=None):
                         """
                         Recursively find all image blob arrays in a nested structure.
                         Image blob pattern: [null/any, 1, "filename", "https://...googleusercontent...", ...]
-                        Returns list of (blob, metadata) tuples.
+                        
+                        Watermark detection is based on parent array position:
+                        - Position [3] = watermarked (first image)
+                        - Position [6] = no watermark (second image)
                         """
                         if input_urls is None:
                             input_urls = set()
@@ -755,24 +790,25 @@ class GeminiClient(GemMixin):
                                     is_generated = False
                                 
                                 if is_generated:
-                                    # Determine watermark status from MIME type or position
-                                    is_watermarked = (
-                                        mime_type == "image/png" or
-                                        (filename and filename.lower().endswith(".png"))
-                                    )
+                                    # Determine watermark status from parent array position
+                                    # Position [3] = watermarked, Position [6] = no watermark
+                                    # This is based on Gemini's response structure where images are at:
+                                    # [[...[BLOB_AT_3], null, null, [BLOB_AT_6]...]]
+                                    is_watermarked = parent_index == 3 if parent_index is not None else True
                                     
                                     results.append({
                                         "url": url,
                                         "filename": filename,
                                         "mime_type": mime_type,
                                         "is_watermarked": is_watermarked,
+                                        "parent_index": parent_index,
                                         "depth": depth,
                                     })
                         
-                        # Recurse into children
-                        for child in node:
+                        # Recurse into children, tracking their index in the parent array
+                        for idx, child in enumerate(node):
                             if isinstance(child, list):
-                                results.extend(find_image_blobs(child, depth + 1, max_depth, input_urls))
+                                results.extend(find_image_blobs(child, depth + 1, max_depth, input_urls, parent_index=idx))
                         
                         return results
                     
@@ -952,15 +988,15 @@ class GeminiClient(GemMixin):
                                 if debug_mode:
                                     logger.debug(f"Found {len(blobs)} image blobs in selected chunk")
                                 
-                                # Sort blobs: JPEG first (no watermark priority), then by depth
-                                jpeg_blobs = [b for b in blobs if not b["is_watermarked"]]
-                                png_blobs = [b for b in blobs if b["is_watermarked"]]
+                                # Sort blobs: no watermark first (position [6]), then watermarked (position [3])
+                                no_watermark_blobs = [b for b in blobs if not b["is_watermarked"]]
+                                watermarked_blobs = [b for b in blobs if b["is_watermarked"]]
                                 
-                                # Add JPEG (no watermark) first
-                                for blob in jpeg_blobs:
+                                # Add non-watermarked images first (position [6])
+                                for blob in no_watermark_blobs:
                                     if not any(img.url == blob["url"] for img in generated_images):
                                         if debug_mode:
-                                            logger.debug(f"Adding JPEG (no watermark): {blob['filename']}")
+                                            logger.debug(f"Adding image (no watermark, pos={blob.get('parent_index', '?')}): {blob['filename']}")
                                         generated_images.append(
                                             GeneratedImage(
                                                 url=blob["url"],
@@ -971,11 +1007,11 @@ class GeminiClient(GemMixin):
                                             )
                                         )
                                 
-                                # Then add PNG (watermarked)
-                                for blob in png_blobs:
+                                # Then add watermarked images (position [3])
+                                for blob in watermarked_blobs:
                                     if not any(img.url == blob["url"] for img in generated_images):
                                         if debug_mode:
-                                            logger.debug(f"Adding PNG (watermark): {blob['filename']}")
+                                            logger.debug(f"Adding image (watermark, pos={blob.get('parent_index', '?')}): {blob['filename']}")
                                         generated_images.append(
                                             GeneratedImage(
                                                 url=blob["url"],

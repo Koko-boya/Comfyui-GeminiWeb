@@ -296,7 +296,7 @@ class GeminiWeb:
         
         try:
             # Save all input images to temp files
-            logger.info(f"Processing {len(images)} input image(s)")
+            logger.info(f"Processing {len(images)} input image(s) with model='{model}'")
             for img_tensor in images:
                 pil_image = tensor_to_pil(img_tensor)
                 temp_path = save_temp_image(pil_image)
