@@ -32,16 +32,16 @@ async def send_request(
 
 
 async def get_access_token(
-    base_cookies: dict, proxy: str | None = None, verbose: bool = False
+    base_cookies: dict, proxy: str | None = None, verbose: bool = False,
+    auth_method: str | None = None
 ) -> tuple[str, dict]:
     """
     Send a get request to gemini.google.com for each group of available cookies and return
     the value of "SNlM0e" as access token on the first successful request.
 
-    Possible cookie sources:
-    - Base cookies passed to the function.
-    - __Secure-1PSID from base cookies with __Secure-1PSIDTS from cache.
-    - Local browser cookies (if optional dependency `browser-cookie3` is installed).
+    Cookie sources depend on auth_method:
+    - "manual": Only use base_cookies (no browser fallback)
+    - "auto_cookies" or None: Try base cookies, cache, and browser in order
 
     Parameters
     ----------
@@ -51,6 +51,9 @@ async def get_access_token(
         Proxy URL.
     verbose: `bool`, optional
         If `True`, will print more infomation in logs.
+    auth_method: `str`, optional
+        Authentication method: "manual" (strict) or "auto_cookies" (try all sources).
+        If None, defaults to "auto_cookies" behavior.
 
     Returns
     -------
@@ -124,49 +127,53 @@ async def get_access_token(
             )
 
     # Browser cookies (if browser-cookie3 is installed)
+    # Only check browser cookies if auth_method is NOT "manual"
     browser_failure_reason = ""
-    try:
-        valid_browser_cookies = 0
-        # Use '.google.com' to match all Google subdomains (gemini.google.com, etc.)
-        browser_cookies, browser_failure_reason = load_browser_cookies(
-            domain_name=".google.com", verbose=verbose
-        )
-        if browser_cookies:
-            for browser, cookies in browser_cookies.items():
-                if secure_1psid := cookies.get("__Secure-1PSID"):
-                    if (
-                        "__Secure-1PSID" in base_cookies
-                        and base_cookies["__Secure-1PSID"] != secure_1psid
-                    ):
+    if auth_method != "manual":
+        try:
+            valid_browser_cookies = 0
+            # Use '.google.com' to match all Google subdomains (gemini.google.com, etc.)
+            browser_cookies, browser_failure_reason = load_browser_cookies(
+                domain_name=".google.com", verbose=verbose
+            )
+            if browser_cookies:
+                for browser, cookies in browser_cookies.items():
+                    if secure_1psid := cookies.get("__Secure-1PSID"):
+                        if (
+                            "__Secure-1PSID" in base_cookies
+                            and base_cookies["__Secure-1PSID"] != secure_1psid
+                        ):
+                            if verbose:
+                                logger.debug(
+                                    f"Skipping loading local browser cookies from {browser}. "
+                                    f"__Secure-1PSID does not match the one provided."
+                                )
+                            continue
+
+                        local_cookies = {"__Secure-1PSID": secure_1psid}
+                        if secure_1psidts := cookies.get("__Secure-1PSIDTS"):
+                            local_cookies["__Secure-1PSIDTS"] = secure_1psidts
+                        if nid := cookies.get("NID"):
+                            local_cookies["NID"] = nid
+                        tasks.append(Task(send_request(local_cookies, proxy=proxy)))
+                        valid_browser_cookies += 1
                         if verbose:
-                            logger.debug(
-                                f"Skipping loading local browser cookies from {browser}. "
-                                f"__Secure-1PSID does not match the one provided."
-                            )
-                        continue
+                            logger.debug(f"Loaded local browser cookies from {browser}")
 
-                    local_cookies = {"__Secure-1PSID": secure_1psid}
-                    if secure_1psidts := cookies.get("__Secure-1PSIDTS"):
-                        local_cookies["__Secure-1PSIDTS"] = secure_1psidts
-                    if nid := cookies.get("NID"):
-                        local_cookies["NID"] = nid
-                    tasks.append(Task(send_request(local_cookies, proxy=proxy)))
-                    valid_browser_cookies += 1
-                    if verbose:
-                        logger.debug(f"Loaded local browser cookies from {browser}")
-
-        if valid_browser_cookies == 0 and verbose:
-            logger.debug(
-                "Skipping loading local browser cookies. Login to gemini.google.com in your browser first."
-            )
-    except ImportError:
-        if verbose:
-            logger.debug(
-                "Skipping loading local browser cookies. Optional dependency 'browser-cookie3' is not installed."
-            )
-    except Exception as e:
-        if verbose:
-            logger.warning(f"Skipping loading local browser cookies. {e}")
+            if valid_browser_cookies == 0 and verbose:
+                logger.debug(
+                    "Skipping loading local browser cookies. Login to gemini.google.com in your browser first."
+                )
+        except ImportError:
+            if verbose:
+                logger.debug(
+                    "Skipping loading local browser cookies. Optional dependency 'browser-cookie3' is not installed."
+                )
+        except Exception as e:
+            if verbose:
+                logger.warning(f"Skipping loading local browser cookies. {e}")
+    elif verbose:
+        logger.debug("Skipping browser cookies check (auth_method='manual')")
 
     if not tasks:
         # Include the detailed browser failure reason if available

@@ -137,8 +137,13 @@ class GeminiClient(GemMixin):
         """
 
         try:
+            # Determine auth_method: if cookies were provided at init, use "manual" (strict)
+            # Otherwise use "auto_cookies" to try all sources
+            auth_method = "manual" if self.cookies else "auto_cookies"
+            
             access_token, valid_cookies = await get_access_token(
-                base_cookies=self.cookies, proxy=self.proxy, verbose=verbose
+                base_cookies=self.cookies, proxy=self.proxy, verbose=verbose,
+                auth_method=auth_method
             )
 
             self.client = AsyncClient(
@@ -316,32 +321,26 @@ class GeminiClient(GemMixin):
             import uuid
             session_uuid = str(uuid.uuid4()).upper()
             
-            # Image mode has two sub-cases:
-            # 1. Text-to-image (no files): Use extended headers with model ID and session UUID
-            # 2. Image-to-image (with files): Use standard model headers only
-            #    The extended headers cause i2i requests to return empty responses
+            # Both t2i and i2i use the SAME extended headers structure
+            # Browser analysis confirmed: identical headers, identical 67-element payload
+            # The only difference is file data embedded in prompt_data[3] for i2i
             
-            if files:
-                # Image-to-Image: Use standard model headers (matches upstream Gemini-API)
-                logger.debug(f"Image mode (i2i): Using standard model headers for editing")
-                if model.model_header:
-                    final_headers = {**model.model_header}
+            # Extract model ID from model header or use default
+            model_header_str = model.model_header.get("x-goog-ext-525001261-jspb", "") if model.model_header else ""
+            if '"' in model_header_str:
+                # Extract model ID from existing header
+                model_id = model_header_str.split('"')[1]
             else:
-                # Text-to-Image: Use extended headers with model ID and session UUID
-                # Image mode REQUIRES a valid model ID - default to gemini-3-flash if unspecified
-                model_header_str = model.model_header.get("x-goog-ext-525001261-jspb", "")
-                if '"' in model_header_str:
-                    # Extract model ID from existing header
-                    model_id = model_header_str.split('"')[1]
-                else:
-                    # Default to gemini-3-flash model ID for image mode
-                    model_id = "9ec249fc9ad08861"  # G_2_5_FLASH model ID
-                
-                final_headers["x-goog-ext-525001261-jspb"] = f'[1,null,null,null,"{model_id}",null,null,0,[4],null,null,2]'
-                final_headers["x-goog-ext-525005358-jspb"] = f'["{session_uuid}",1]'
-                # Note: x-goog-ext-73010989-jspb is now included in base GEMINI headers
-                
-                logger.debug(f"Image mode (t2i): model_name='{model.model_name}', model_id='{model_id}'")
+                # Default to gemini-3-flash model ID for image mode
+                model_id = "9ec249fc9ad08861"  # G_2_5_FLASH model ID
+            
+            # Use extended headers for ALL image mode requests
+            final_headers["x-goog-ext-525001261-jspb"] = f'[1,null,null,null,"{model_id}",null,null,0,[4],null,null,1]'
+            final_headers["x-goog-ext-525005358-jspb"] = f'["{session_uuid}",1]'
+            # Note: x-goog-ext-73010989-jspb is now included in base GEMINI headers
+            
+            mode_type = "i2i" if files else "t2i"
+            logger.debug(f"Image mode ({mode_type}): model_name='{model.model_name}', model_id='{model_id}'")
         else:
             # Non-image mode: use model headers if specified
             session_uuid = None  # No session UUID needed for text mode
@@ -382,58 +381,45 @@ class GeminiClient(GemMixin):
             chat_metadata = chat.metadata if chat else ["", "", "", None, None, None, None, None, None, ""]
             
             if image_mode:
-                # Image mode has two sub-cases:
-                # 1. Text-to-image (no files): Use 67-element array with image generation flags
-                # 2. Image-to-image (with files): Use simpler structure matching upstream Gemini-API
-                #    The complex array structure breaks when files are attached
+                # Both t2i and i2i use the SAME 67-element payload structure
+                # Browser analysis confirmed: identical structure, only difference is:
+                # - t2i: prompt_data = [prompt, 0, null, null, null, null, 0]
+                # - i2i: prompt_data = [prompt, 0, null, [[file_data]], null, null, 0] (file at [3])
+                #
+                # Payload Structure Documentation:
+                #   [0]  = prompt_data: User prompt with optional file attachments
+                #   [1]  = ["en"]: Language setting
+                #   [2]  = chat_metadata: [cid, rid, rcid, ...] for conversation continuity
+                #   [7]  = 1: Enable image generation mode
+                #   [10] = 1: Secondary image mode flag
+                #   [17] = [[0]]: Image mode indicator array
+                #   [27] = 1: Required flag for image processing
+                #   [30] = [4]: Image format preference (4 = standard)
+                #   [41] = [1]: Required processing flag
+                #   [49] = 14: Image generation operation type
+                #   [59] = session_uuid: Unique session identifier
+                #   [66] = [timestamp_sec, timestamp_ns]: Request timestamp
+                import time
+                current_time = int(time.time())
+                timestamp_ns = int((time.time() % 1) * 1000000000)
                 
-                if files:
-                    # Image-to-Image: Use simpler payload structure (matches upstream Gemini-API)
-                    # This format works for editing images with prompts
-                    logger.debug(f"Image mode (i2i): Using simple payload with {len(files)} file(s)")
-                    inner_payload = [
-                        prompt_data,  # [prompt, 0, None, [[file_data], filename], None, None, 0]
-                        None,
-                        chat_metadata,
-                    ]
-                    # Append gem_id if provided
-                    if gem_id:
-                        inner_payload.extend([None] * 16 + [gem_id])
-                else:
-                    # Text-to-Image: Use 67-element array with image generation flags
-                    # Payload Structure Documentation:
-                    #   [0]  = prompt_data: User prompt with optional file attachments
-                    #   [1]  = ["en"]: Language setting
-                    #   [2]  = chat_metadata: [cid, rid, rcid, ...] for conversation continuity
-                    #   [7]  = 1: Enable image generation mode
-                    #   [10] = 1: Secondary image mode flag
-                    #   [17] = [[0]]: Image mode indicator array
-                    #   [27] = 1: Required flag for image processing
-                    #   [30] = [4]: Image format preference (4 = standard)
-                    #   [41] = [1]: Required processing flag
-                    #   [49] = 14: Image generation operation type
-                    #   [59] = session_uuid: Unique session identifier
-                    #   [66] = [timestamp_sec, timestamp_ns]: Request timestamp
-                    import time
-                    current_time = int(time.time())
-                    timestamp_ns = int((time.time() % 1) * 1000000000)
-                    
-                    logger.debug(f"Image mode (t2i): Using 67-element payload for generation")
-                    image_mode_values = {
-                        0: prompt_data,
-                        1: ["en"],
-                        2: chat_metadata,
-                        7: 1,
-                        10: 1,
-                        17: [[0]],
-                        27: 1,
-                        30: [4],
-                        41: [1],
-                        49: 14,
-                        59: session_uuid,
-                        66: [current_time, timestamp_ns],
-                    }
-                    inner_payload = build_payload(67, image_mode_values)
+                mode_type = "i2i" if files else "t2i"
+                logger.debug(f"Image mode ({mode_type}): Using 67-element payload with {len(files) if files else 0} file(s)")
+                image_mode_values = {
+                    0: prompt_data,
+                    1: ["en"],
+                    2: chat_metadata,
+                    7: 1,
+                    10: 1,
+                    17: [[0]],
+                    27: 1,
+                    30: [4],
+                    41: [1],
+                    49: 14,
+                    59: session_uuid,
+                    66: [current_time, timestamp_ns],
+                }
+                inner_payload = build_payload(67, image_mode_values)
             else:
                 # Text mode: Simpler payload structure
                 text_mode_values = {
@@ -735,8 +721,39 @@ class GeminiClient(GemMixin):
                     # hunt-and-peck index verification, priority-based extraction,
                     # MIME-based watermark detection, safety handling, early exit
                     # =====================================================
-                    
                     generated_images = []
+                    
+                    # Helper: Normalize object-based responses to list format
+                    # gemini-3-pro returns: {"7": [3], "8": [[[[blob]]]]} 
+                    # gemini-3-flash returns: [null,..., [3], [[[[blob]]]]]
+                    def normalize_image_container(container):
+                        """
+                        Convert object-based image container to list format.
+                        Some models (gemini-3-pro) return dict with string keys like '7', '8'
+                        instead of a list with numeric indices.
+                        """
+                        if isinstance(container, dict):
+                            # Find the maximum key to determine list size
+                            max_key = 0
+                            for key in container.keys():
+                                try:
+                                    max_key = max(max_key, int(key))
+                                except (ValueError, TypeError):
+                                    pass
+                            
+                            # Convert to list
+                            result = [None] * (max_key + 1)
+                            for key, value in container.items():
+                                try:
+                                    result[int(key)] = value
+                                except (ValueError, TypeError):
+                                    pass
+                            
+                            if debug_mode:
+                                logger.debug(f"Normalized dict container with keys {list(container.keys())} to list of len {len(result)}")
+                            
+                            return result
+                        return container
                     
                     # Helper: Recursive image blob finder
                     def find_image_blobs(node, depth=0, max_depth=12, input_urls=None, parent_index=None):
@@ -816,18 +833,57 @@ class GeminiClient(GemMixin):
                     def find_image_container(cand, expected_index=12):
                         """
                         Find the image data container, using hunt-and-peck if the expected index is wrong.
-                        Returns the container and its actual index.
+                        Returns the container (normalized to list) and its actual index.
+                        
+                        Handles both:
+                        - List format: cand[12] = [null, null, null, null, null, null, [3], [[[[blob]]]]]
+                        - Dict format: cand[12] = {"7": [3], "8": [[[[blob]]]]} (gemini-3-pro)
                         """
+                        # Special case: If cand itself is a dict with image keys like '7', '8'
+                        # This happens with gemini-3-pro where the candidate structure is object-based
+                        if isinstance(cand, dict):
+                            # Check if this dict has image-related keys
+                            if '7' in cand or '8' in cand or 7 in cand or 8 in cand:
+                                normalized = normalize_image_container(cand)
+                                if verify_image_container(normalized):
+                                    if debug_mode:
+                                        logger.debug(f"Candidate is dict-based with image keys, normalized to list")
+                                    return normalized, 0  # Return 0 as pseudo-index
+                        
                         # Try expected index first
                         container = get_nested_value(cand, [expected_index])
+                        
+                        # Unwrap single-element list containing a dict (gemini-3-pro format)
+                        # candidate[12] = [{"7": [3], "8": [[[[blob]]]]}] instead of just the dict
+                        if isinstance(container, list) and len(container) == 1 and isinstance(container[0], dict):
+                            if debug_mode:
+                                logger.debug(f"Unwrapping single-element list at [{expected_index}]")
+                            container = container[0]
+                        
+                        # If container is a dict, normalize it
+                        if isinstance(container, dict):
+                            container = normalize_image_container(container)
+                        
                         if verify_image_container(container):
                             return container, expected_index
                         
                         # Hunt in neighboring indices
-                        for i in range(max(0, expected_index - 3), min(len(cand) if isinstance(cand, list) else 20, expected_index + 4)):
+                        search_range = range(max(0, expected_index - 3), min(len(cand) if isinstance(cand, list) else 20, expected_index + 4))
+                        for i in search_range:
                             if i == expected_index:
                                 continue
                             container = get_nested_value(cand, [i])
+                            
+                            # Unwrap single-element list containing a dict
+                            if isinstance(container, list) and len(container) == 1 and isinstance(container[0], dict):
+                                if debug_mode:
+                                    logger.debug(f"Unwrapping single-element list at [{i}]")
+                                container = container[0]
+                            
+                            # Normalize dict containers
+                            if isinstance(container, dict):
+                                container = normalize_image_container(container)
+                            
                             if verify_image_container(container):
                                 if debug_mode:
                                     logger.debug(f"Image container found at [{i}] instead of [{expected_index}]")
@@ -837,11 +893,19 @@ class GeminiClient(GemMixin):
                     
                     def verify_image_container(container):
                         """Verify this is an image container by checking for expected structure."""
-                        if not isinstance(container, list) or len(container) < 6:
+                        if container is None:
                             return False
-                        # Check for image mode indicators at [6] or [7]
-                        has_status = isinstance(get_nested_value(container, [6]), list)
-                        has_img_data = get_nested_value(container, [7]) is not None
+                        
+                        # Must be a list after normalization
+                        if not isinstance(container, list):
+                            return False
+                        
+                        if len(container) < 6:
+                            return False
+                        
+                        # Check for image mode indicators at [6] or [7] or [8]
+                        has_status = isinstance(get_nested_value(container, [6]), list) or isinstance(get_nested_value(container, [7]), list)
+                        has_img_data = get_nested_value(container, [7]) is not None or get_nested_value(container, [8]) is not None
                         return has_status or has_img_data
                     
                     # Helper: Score a chunk for image content
@@ -860,9 +924,13 @@ class GeminiClient(GemMixin):
                         if img_container:
                             score += 10
                         
-                        # Check status
-                        status_arr = get_nested_value(img_container, [6]) if img_container else None
-                        status = status_arr[0] if isinstance(status_arr, list) and status_arr else -1
+                        # Check status at [6] or [7] (different model formats)
+                        status = -1
+                        for status_idx in [6, 7]:
+                            status_arr = get_nested_value(img_container, [status_idx]) if img_container else None
+                            if isinstance(status_arr, list) and status_arr and isinstance(status_arr[0], int):
+                                status = status_arr[0]
+                                break
                         
                         if isinstance(status, int):
                             if status >= ImageStatus.IN_PROGRESS:
@@ -873,10 +941,13 @@ class GeminiClient(GemMixin):
                             if status in [ImageStatus.SAFETY_BLOCKED, ImageStatus.ERROR]:
                                 return -100, part_cand  # Blocked - negative score
                         
-                        # Check for image data at primary path [7]
-                        primary_data = get_nested_value(img_container, [7, 0]) if img_container else None
-                        if primary_data:
-                            score += 20
+                        # Check for image data at primary paths [7] or [8]
+                        primary_data = None
+                        for data_idx in [7, 8]:
+                            primary_data = get_nested_value(img_container, [data_idx, 0]) if img_container else None
+                            if primary_data:
+                                score += 20
+                                break
                         
                         # Check for /gg-dl/ URLs (strongest signal)
                         blobs = find_image_blobs(img_container, input_urls=input_urls) if img_container else []
@@ -886,15 +957,51 @@ class GeminiClient(GemMixin):
                         return score, part_cand
                     
                     # Check if image mode is active
+                    if debug_mode:
+                        # Log candidate structure for debugging
+                        cand_type = type(candidate).__name__
+                        cand_len = len(candidate) if isinstance(candidate, (list, dict)) else "N/A"
+                        logger.debug(f"Candidate type={cand_type}, len={cand_len}")
+                        if isinstance(candidate, list):
+                            for i in range(min(15, len(candidate))):
+                                val = candidate[i]
+                                if val is not None:
+                                    val_type = type(val).__name__
+                                    val_preview = str(val)[:80] if not isinstance(val, (list, dict)) else f"{val_type}(len={len(val) if hasattr(val, '__len__') else '?'})"
+                                    logger.debug(f"  candidate[{i}] = {val_preview}")
+                    
                     img_container, img_container_idx = find_image_container(candidate)
                     is_image_mode = img_container is not None
                     
+                    if debug_mode:
+                        if is_image_mode:
+                            logger.debug(f"Image mode: ENABLED (container at [{img_container_idx}])")
+                        else:
+                            logger.debug(f"Image mode: DISABLED (no container found)")
+                    
+                    # Helper: Get image status from container (handles different positions)
+                    def get_image_status(container):
+                        """Extract image status from container, checking [6] then [7]."""
+                        if not container:
+                            return None, None
+                        
+                        # Try [6] first (gemini-3-flash format)
+                        status_arr = get_nested_value(container, [6])
+                        if isinstance(status_arr, list) and status_arr and isinstance(status_arr[0], int):
+                            return status_arr, status_arr[0]
+                        
+                        # Try [7] (gemini-3-pro format)
+                        status_arr = get_nested_value(container, [7])
+                        if isinstance(status_arr, list) and status_arr and isinstance(status_arr[0], int):
+                            return status_arr, status_arr[0]
+                        
+                        return None, None
+                    
                     if is_image_mode:
-                        status_arr = get_nested_value(img_container, [6])
-                        img_mode_status = status_arr[0] if isinstance(status_arr, list) and status_arr else None
+                        status_arr, img_mode_status = get_image_status(img_container)
                         
                         if debug_mode:
-                            logger.debug(f"Image mode detected at [{img_container_idx}][6] = {status_arr}, status={img_mode_status}")
+                            logger.debug(f"Image mode detected at [{img_container_idx}], status_arr = {status_arr}, status={img_mode_status}")
                         
                         # Check for safety/blocked status
                         if isinstance(img_mode_status, int) and img_mode_status in [ImageStatus.SAFETY_BLOCKED, ImageStatus.ERROR]:
@@ -949,8 +1056,14 @@ class GeminiClient(GemMixin):
                                     
                                     # Check if this is a final chunk (status=3) with images
                                     cand_container, _ = find_image_container(part_cand)
-                                    cand_status_arr = get_nested_value(cand_container, [6]) if cand_container else None
-                                    cand_status = cand_status_arr[0] if isinstance(cand_status_arr, list) and cand_status_arr else -1
+                                    
+                                    # Check status at [6] or [7]
+                                    cand_status = -1
+                                    for status_idx in [6, 7]:
+                                        cand_status_arr = get_nested_value(cand_container, [status_idx]) if cand_container else None
+                                        if isinstance(cand_status_arr, list) and cand_status_arr and isinstance(cand_status_arr[0], int):
+                                            cand_status = cand_status_arr[0]
+                                            break
                                     
                                     if cand_status == 3 and score >= 30:
                                         if debug_mode:
@@ -964,7 +1077,19 @@ class GeminiClient(GemMixin):
                             logger.debug(f"Selected chunk {best_chunk_idx} with score={best_score}")
                         
                         if best_candidate is not None:
-                            img_cand_container, _ = find_image_container(best_candidate)
+                            img_cand_container, container_idx = find_image_container(best_candidate)
+                            
+                            if debug_mode:
+                                # Log container structure for debugging
+                                if img_cand_container:
+                                    logger.debug(f"Image container found at [{container_idx}], type={type(img_cand_container).__name__}, len={len(img_cand_container) if isinstance(img_cand_container, list) else 'N/A'}")
+                                    # Show first few non-null entries
+                                    if isinstance(img_cand_container, list):
+                                        for i, val in enumerate(img_cand_container[:15]):
+                                            if val is not None:
+                                                logger.debug(f"  Container[{i}] = {type(val).__name__}, preview={str(val)[:100]}...")
+                                else:
+                                    logger.debug(f"No image container found in candidate")
                             
                             if img_cand_container:
                                 # Update text if available
