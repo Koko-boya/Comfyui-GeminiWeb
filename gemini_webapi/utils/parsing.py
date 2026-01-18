@@ -2,8 +2,6 @@ from typing import Any
 
 import orjson as json
 
-from .logger import logger
-
 
 def get_nested_value(data: list, path: list[int], default: Any = None) -> Any:
     """
@@ -36,7 +34,10 @@ def get_nested_value(data: list, path: list[int], default: Any = None) -> Any:
 
 def extract_json_from_response(text: str) -> list:
     """
-    Clean and extract the JSON content from a Google API response.
+    Clean and extract JSON content from a Google API streaming response.
+    
+    The response contains multiple JSON chunks prefixed by byte counts (e.g., "332\n[...]").
+    This function collects ALL valid JSON arrays from the response, not just the first one.
 
     Parameters
     ----------
@@ -46,7 +47,7 @@ def extract_json_from_response(text: str) -> list:
     Returns
     -------
     `list`
-        The extracted JSON array or object (should be an array).
+        A list containing all parsed JSON arrays from the streaming response.
 
     Raises
     ------
@@ -61,12 +62,23 @@ def extract_json_from_response(text: str) -> list:
             f"Input text is expected to be a string, got {type(text).__name__} instead."
         )
 
-    # Find the first line which is valid JSON
+    # Collect ALL valid JSON arrays from the streaming response
+    all_chunks = []
+    
     for line in text.splitlines():
+        stripped = line.strip()
+        # Skip empty lines, byte counts (pure digits), and the )]}' prefix
+        if not stripped or stripped.isdigit() or stripped == ")]}'":
+            continue
         try:
-            return json.loads(line.strip())
+            parsed = json.loads(stripped)
+            # Only add if it's a list (valid response chunk)
+            if isinstance(parsed, list):
+                all_chunks.append(parsed)
         except json.JSONDecodeError:
             continue
 
-    # If no JSON is found, raise ValueError
-    raise ValueError("Could not find a valid JSON object or array in the response.")
+    if not all_chunks:
+        raise ValueError("Could not find a valid JSON object or array in the response.")
+    
+    return all_chunks

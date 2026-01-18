@@ -1,6 +1,5 @@
 import asyncio
 import re
-from asyncio import Task
 from pathlib import Path
 from typing import Any, Optional
 
@@ -8,12 +7,11 @@ import orjson as json
 from httpx import AsyncClient, ReadTimeout, Response
 
 from .components import GemMixin
-from .constants import Endpoint, ErrorCode, GRPC, Headers, ImageStatus, Model
+from .constants import Endpoint, ErrorCode, Headers, ImageStatus, Model
 from .exceptions import (
     APIError,
     AuthError,
     GeminiError,
-    ImageGenerationError,
     ModelInvalid,
     TemporarilyBlocked,
     TimeoutError,
@@ -325,22 +323,32 @@ class GeminiClient(GemMixin):
             # Browser analysis confirmed: identical headers, identical 67-element payload
             # The only difference is file data embedded in prompt_data[3] for i2i
             
-            # Extract model ID from model header or use default
+            # Extract model ID and trailing flag from model header or use defaults
             model_header_str = model.model_header.get("x-goog-ext-525001261-jspb", "") if model.model_header else ""
             if '"' in model_header_str:
                 # Extract model ID from existing header
                 model_id = model_header_str.split('"')[1]
+                # Extract trailing flag (last number before closing bracket)
+                # Model header format: [1,null,null,null,"model_id",null,null,0,[4],null,null,X]
+                # where X is the trailing flag (1 for regular, 2 for thinking models)
+                try:
+                    # Parse the last number before the closing bracket
+                    trailing_flag = int(model_header_str.rstrip(']').split(',')[-1])
+                except (ValueError, IndexError):
+                    trailing_flag = 1  # Default
             else:
                 # Default to gemini-3-flash model ID for image mode
                 model_id = "9ec249fc9ad08861"  # G_2_5_FLASH model ID
+                trailing_flag = 1
             
             # Use extended headers for ALL image mode requests
-            final_headers["x-goog-ext-525001261-jspb"] = f'[1,null,null,null,"{model_id}",null,null,0,[4],null,null,1]'
+            # IMPORTANT: Preserve the trailing flag from the model definition
+            final_headers["x-goog-ext-525001261-jspb"] = f'[1,null,null,null,"{model_id}",null,null,0,[4],null,null,{trailing_flag}]'
             final_headers["x-goog-ext-525005358-jspb"] = f'["{session_uuid}",1]'
             # Note: x-goog-ext-73010989-jspb is now included in base GEMINI headers
             
             mode_type = "i2i" if files else "t2i"
-            logger.debug(f"Image mode ({mode_type}): model_name='{model.model_name}', model_id='{model_id}'")
+            logger.debug(f"Image mode ({mode_type}): model_name='{model.model_name}', model_id='{model_id}', trailing_flag={trailing_flag}")
         else:
             # Non-image mode: use model headers if specified
             session_uuid = None  # No session UUID needed for text mode
@@ -359,17 +367,25 @@ class GeminiClient(GemMixin):
             
             # Build prompt data for position 0
             if files:
+                # Upload files using browser-matching resumable protocol
+                uploaded_files = []
+                for file in files:
+                    file_id = await upload_file(
+                        file=file,
+                        cookies=self.cookies,
+                        proxy=self.proxy,
+                        debug=debug_mode,
+                    )
+                    uploaded_files.append([
+                        [file_id],
+                        parse_file_name(file),
+                    ])
+                
                 prompt_data = [
                     prompt,
                     0,
                     None,
-                    [
-                        [
-                            [await upload_file(file, self.proxy)],
-                            parse_file_name(file),
-                        ]
-                        for file in files
-                    ],
+                    uploaded_files,
                     None,
                     None,
                     0,
@@ -382,29 +398,14 @@ class GeminiClient(GemMixin):
             
             if image_mode:
                 # Both t2i and i2i use the SAME 67-element payload structure
-                # Browser analysis confirmed: identical structure, only difference is:
-                # - t2i: prompt_data = [prompt, 0, null, null, null, null, 0]
-                # - i2i: prompt_data = [prompt, 0, null, [[file_data]], null, null, 0] (file at [3])
-                #
-                # Payload Structure Documentation:
-                #   [0]  = prompt_data: User prompt with optional file attachments
-                #   [1]  = ["en"]: Language setting
-                #   [2]  = chat_metadata: [cid, rid, rcid, ...] for conversation continuity
-                #   [7]  = 1: Enable image generation mode
-                #   [10] = 1: Secondary image mode flag
-                #   [17] = [[0]]: Image mode indicator array
-                #   [27] = 1: Required flag for image processing
-                #   [30] = [4]: Image format preference (4 = standard)
-                #   [41] = [1]: Required processing flag
-                #   [49] = 14: Image generation operation type
-                #   [59] = session_uuid: Unique session identifier
-                #   [66] = [timestamp_sec, timestamp_ns]: Request timestamp
                 import time
                 current_time = int(time.time())
                 timestamp_ns = int((time.time() % 1) * 1000000000)
                 
                 mode_type = "i2i" if files else "t2i"
                 logger.debug(f"Image mode ({mode_type}): Using 67-element payload with {len(files) if files else 0} file(s)")
+                
+                # Payload construction (same for all models)
                 image_mode_values = {
                     0: prompt_data,
                     1: ["en"],
@@ -559,10 +560,9 @@ class GeminiClient(GemMixin):
                         f.write(sanitized_output)
                     print(f"[Gemini Debug] Saved parsed response to {debug_dir}/debug_response.json (location data redacted)")
                     
-                    # Also save raw response for complete debugging (sanitized)
-                    sanitized_raw = sanitize_response(response.text)
+                    # Also save raw response for complete debugging (NOT sanitized for full analysis)
                     with open(os.path.join(debug_dir, "debug_response_raw.txt"), "w", encoding="utf-8") as f:
-                        f.write(sanitized_raw)
+                        f.write(response.text)
                     print(f"[Gemini Debug] Saved raw response to {debug_dir}/debug_response_raw.txt")
                 except Exception as e:
                     logger.debug(f"Failed to save response: {e}")
@@ -573,7 +573,16 @@ class GeminiClient(GemMixin):
             body_index = 0
 
             try:
-                response_json = extract_json_from_response(response.text)
+                # extract_json_from_response now returns a list of chunks
+                # Each chunk is itself a list like [["wrb.fr", ...]]
+                response_chunks = extract_json_from_response(response.text)
+                
+                # Flatten all chunks into a single list for processing
+                # Each chunk contains parts like [["wrb.fr", null, "..."]]
+                response_json = []
+                for chunk in response_chunks:
+                    if isinstance(chunk, list):
+                        response_json.extend(chunk)
 
                 # Find the best body - look for the chunk with actual text content
                 # Streaming responses have multiple chunks; early ones may have empty text
@@ -1029,18 +1038,28 @@ class GeminiClient(GemMixin):
                         best_candidate = None
                         best_chunk_idx = -1
                         
+                        if debug_mode:
+                            logger.debug(f"Starting chunk scoring: {len(response_json)} total chunks, initial img_mode_status={img_mode_status}")
+                        
                         for part_idx, part in enumerate(response_json):
                             try:
                                 # EARLY EXIT: Skip chunks with status < 2 (JSON peek optimization)
                                 raw_body = get_nested_value(part, [2])
                                 if not raw_body:
+                                    if debug_mode:
+                                        logger.debug(f"Chunk {part_idx}: Skipped (no raw_body)")
                                     continue
                                 
+                                has_gg_dl = "gg-dl" in raw_body
+                                
                                 # Peek for markers before expensive parsing
-                                if "gg-dl" not in raw_body and img_mode_status is not None and img_mode_status < 3:
+                                if not has_gg_dl and img_mode_status is not None and img_mode_status < 3:
                                     if debug_mode:
-                                        logger.debug(f"Chunk {part_idx}: Skipped (no /gg-dl/ marker, status < 3)")
+                                        logger.debug(f"Chunk {part_idx}: Skipped (no /gg-dl/ marker, img_mode_status={img_mode_status} < 3)")
                                     continue
+                                
+                                if debug_mode:
+                                    logger.debug(f"Chunk {part_idx}: Processing (has_gg_dl={has_gg_dl}, raw_body_len={len(raw_body)})")
                                 
                                 part_json = json.loads(raw_body)
                                 score, part_cand = score_chunk(part_json, candidate_index, input_urls)
@@ -1070,7 +1089,9 @@ class GeminiClient(GemMixin):
                                             logger.debug(f"EARLY EXIT: status=3 with score={score}")
                                         break
                                 
-                            except json.JSONDecodeError:
+                            except json.JSONDecodeError as e:
+                                if debug_mode:
+                                    logger.debug(f"Chunk {part_idx}: JSON decode error: {e}")
                                 continue
                         
                         if debug_mode:

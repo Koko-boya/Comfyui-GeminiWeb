@@ -25,3 +25,6 @@ Thumbs.db
 
 # HTTP Archive files (debugging)
 *.har
+
+# Architecture doc (internal)
+ARCHITECTURE.md

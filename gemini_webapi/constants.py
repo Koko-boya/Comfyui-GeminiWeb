@@ -6,7 +6,7 @@ class Endpoint(StrEnum):
     INIT = "https://gemini.google.com/app"
     GENERATE = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
     ROTATE_COOKIES = "https://accounts.google.com/RotateCookies"
-    UPLOAD = "https://content-push.googleapis.com/upload"
+    UPLOAD = "https://push.clients6.google.com/upload/"
     BATCH_EXEC = "https://gemini.google.com/_/BardChatUi/data/batchexecute"
 
 
@@ -37,22 +37,26 @@ class Headers(Enum):
         "Host": "gemini.google.com",
         "Origin": "https://gemini.google.com",
         "Referer": "https://gemini.google.com/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
         "X-Same-Domain": "1",
         "x-goog-ext-73010989-jspb": "[0]",
     }
     ROTATE_COOKIES = {
         "Content-Type": "application/json",
     }
-    UPLOAD = {"Push-ID": "feeds/mcudyrk2a4khkz"}
+    UPLOAD = {
+        "Push-ID": "feeds/mcudyrk2a4khkz",
+        "x-goog-upload-protocol": "resumable",
+        "x-tenant-id": "bard-storage",
+    }
     IMAGE_MODE = {
         "x-goog-ext-525001261-jspb": "[1,null,null,null,null,null,null,0,[4],null,null,2]",
         "x-goog-ext-73010989-jspb": "[0]",
     }
     BROWSER = {
         "x-browser-channel": "stable",
-        "x-browser-copyright": "Copyright 2025 Google LLC. All rights reserved.",
-        "x-browser-year": "1969",
+        "x-browser-copyright": "Copyright 2026 Google LLC. All Rights reserved.",
+        "x-browser-year": "2026",
     }
 
 
