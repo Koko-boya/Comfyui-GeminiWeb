@@ -600,17 +600,31 @@ class GeminiClient(GemMixin):
                         if candidates:
                             # Check if this chunk has actual text content
                             text_content = get_nested_value(candidates, [0, 1, 0], "")
-                            
+
                             if debug_mode:
                                 logger.debug(f"Part {part_index}: text_content = '{text_content[:50] if text_content else 'None'}...'")
-                            
+
                             # Prefer chunks with text, but keep any valid candidate as fallback
+                            # This is important for image-to-image where text may be empty
                             if text_content and text_content.strip():
                                 best_body = part_json
                                 best_body_index = part_index
                             elif best_body is None:
                                 best_body = part_json
                                 best_body_index = part_index
+                        else:
+                            # For i2i responses, candidates might be structured differently
+                            # Check if this chunk has any image-related data before skipping
+                            if best_body is None and isinstance(part_json, list) and len(part_json) >= 5:
+                                # Look for candidate-like structures at various indices
+                                for check_idx in [4, 3, 5]:
+                                    alt_candidates = get_nested_value(part_json, [check_idx])
+                                    if alt_candidates and isinstance(alt_candidates, list) and len(alt_candidates) > 0:
+                                        if debug_mode:
+                                            logger.debug(f"Part {part_index}: Found candidates at alternate index [{check_idx}]")
+                                        best_body = part_json
+                                        best_body_index = part_index
+                                        break
                     except json.JSONDecodeError:
                         continue
 
@@ -877,7 +891,13 @@ class GeminiClient(GemMixin):
                             return container, expected_index
                         
                         # Hunt in neighboring indices
-                        search_range = range(max(0, expected_index - 3), min(len(cand) if isinstance(cand, list) else 20, expected_index + 4))
+                        # For dict-based candidates, use a wider search range since we can't determine length
+                        if isinstance(cand, list):
+                            search_end = min(len(cand), expected_index + 6)
+                        else:
+                            # For dicts or unknown types, search a reasonable range
+                            search_end = expected_index + 8
+                        search_range = range(max(0, expected_index - 4), search_end)
                         for i in search_range:
                             if i == expected_index:
                                 continue
@@ -1051,12 +1071,13 @@ class GeminiClient(GemMixin):
                                     continue
                                 
                                 has_gg_dl = "gg-dl" in raw_body
-                                
-                                # Peek for markers before expensive parsing
-                                if not has_gg_dl and img_mode_status is not None and img_mode_status < 3:
-                                    if debug_mode:
-                                        logger.debug(f"Chunk {part_idx}: Skipped (no /gg-dl/ marker, img_mode_status={img_mode_status} < 3)")
-                                    continue
+
+                                # Note: We used to skip chunks without /gg-dl/ markers when status < 3,
+                                # but this caused image-to-image to fail because:
+                                # 1. The initial img_mode_status may not reflect the actual state
+                                # 2. i2i responses may have images in chunks without /gg-dl/ markers
+                                # 3. The status progression may differ between t2i and i2i
+                                # So we now process all chunks regardless of markers.
                                 
                                 if debug_mode:
                                     logger.debug(f"Chunk {part_idx}: Processing (has_gg_dl={has_gg_dl}, raw_body_len={len(raw_body)})")
